@@ -1,6 +1,7 @@
 //! `plaind` library surface — shared by the daemon binary and its integration
 //! test. See `main.rs` for the CLI.
 
+pub mod autostart;
 pub mod input;
 pub mod pairing;
 pub mod proto;
