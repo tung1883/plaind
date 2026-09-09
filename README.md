@@ -1,4 +1,4 @@
-# plaind
+<h1><img src="assets/plaind-128.png" alt="plaind icon" width="40" align="left" /> plaind</h1>
 
 Companion daemon for the **Plain** phone's Dev plugin. One TCP socket carries an
 interactive shell, a low-fi screen mirror and a process list to the phone.

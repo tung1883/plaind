@@ -5,6 +5,7 @@ use anyhow::Result;
 use rmpv::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -16,10 +17,15 @@ use crate::procs::Procs;
 use crate::pty::sessions;
 use crate::screen::ScreenStream;
 
+/// How many phones are connected right now (for the tray label).
+pub static CONNECTED: AtomicUsize = AtomicUsize::new(0);
+
 pub async fn handle(stream: TcpStream, peer: SocketAddr) {
+    CONNECTED.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = run(stream, peer).await {
-        eprintln!("[{peer}] session ended: {e}");
+        crate::plog!("[{peer}] session ended: {e}");
     }
+    CONNECTED.fetch_sub(1, Ordering::Relaxed);
 }
 
 async fn run(stream: TcpStream, peer: SocketAddr) -> Result<()> {
@@ -71,7 +77,7 @@ where
         return Ok(());
     }
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
-    eprintln!("[{peer}] paired device connected: {device}");
+    crate::plog!("[{peer}] paired device connected: {device}");
 
     let mut caps = vec!["pty", "session", "proc"];
     if ScreenStream::SUPPORTED {
@@ -106,7 +112,7 @@ where
                         if !replay.is_empty() {
                             tx.send(proto::pty_data(ch, &replay)).await.ok();
                         }
-                        eprintln!("[{peer}] pty.open ch={ch} -> session {} {cols}x{rows}", sess.id);
+                        crate::plog!("[{peer}] pty.open ch={ch} -> session {} {cols}x{rows}", sess.id);
                     }
                     Err(e) => {
                         tx.send(chan_error(ch, &format!("pty failed: {e}"))).await.ok();
@@ -152,7 +158,7 @@ where
                 if !replay.is_empty() {
                     tx.send(proto::pty_data(ch, &replay)).await.ok();
                 }
-                eprintln!("[{peer}] session.open ch={ch} -> session {} ({})", i.id, i.name);
+                crate::plog!("[{peer}] session.open ch={ch} -> session {} ({})", i.id, i.name);
             }
             "session.detach" => {
                 if let Some(id) = attached.remove(&ch) {
@@ -212,7 +218,7 @@ where
                     let fps = proto::get_i64(&frame, "fps").unwrap_or(5);
                     let cursor = proto::get(&frame, "cursor").and_then(|v| v.as_bool()).unwrap_or(true);
                     screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, tx.clone()));
-                    eprintln!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor}");
+                    crate::plog!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor}");
                 }
             }
             "screen.stop" => {
@@ -230,11 +236,11 @@ where
                 let pid = proto::get_i64(&frame, "pid").unwrap_or(0);
                 let sig = proto::get_str(&frame, "sig").unwrap_or("TERM");
                 let ok = procs.kill(pid, sig);
-                eprintln!("[{peer}] proc.kill pid={pid} sig={sig} ok={ok}");
+                crate::plog!("[{peer}] proc.kill pid={pid} sig={sig} ok={ok}");
                 tx.send(proto::proc_killed(ch, pid, ok)).await.ok();
             }
             other => {
-                eprintln!("[{peer}] ignoring {other}");
+                crate::plog!("[{peer}] ignoring {other}");
             }
         }
     }

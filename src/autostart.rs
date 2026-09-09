@@ -14,8 +14,8 @@ pub fn ensure() {
         return;
     }
     match install() {
-        Ok(()) => eprintln!("plaind: set to start on login  (undo: plaind uninstall)"),
-        Err(e) => eprintln!("plaind: could not set autostart: {e:#}"),
+        Ok(()) => crate::plog!("plaind: set to start on login  (undo: plaind uninstall)"),
+        Err(e) => crate::plog!("plaind: could not set autostart: {e:#}"),
     }
 }
 

@@ -54,7 +54,7 @@ impl ScreenStream {
                         let t_enc = t2.elapsed();
                         if report.elapsed() >= Duration::from_secs(2) {
                             report = std::time::Instant::now();
-                            eprintln!(
+                            crate::plog!(
                                 "[screen] cap {:?}  scale {:?}  enc {:?}  jpeg {}KB  {}x{}",
                                 t_cap, t_scale, t_enc, jpeg.len() / 1024, fw, fh
                             );
