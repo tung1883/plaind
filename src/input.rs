@@ -17,6 +17,7 @@ enum Cmd {
     Click(String, bool),
     Press(bool),
     Key(Option<String>, Option<String>, Vec<String>),
+    Zoom(f64),
 }
 
 impl Input {
@@ -27,7 +28,7 @@ impl Input {
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
         std::thread::spawn(move || {
             #[allow(unused_imports)]
-            use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+            use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
             let mut enigo = match Enigo::new(&Settings::default()) {
                 Ok(e) => e,
                 Err(_) => return,
@@ -44,6 +45,15 @@ impl Input {
                     }
                     Cmd::Point(nx, ny) => {
                         point_absolute(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
+                    }
+                    // Trackpad pinch: Ctrl + wheel, which most apps read as zoom.
+                    Cmd::Zoom(ticks) => {
+                        let n = ticks.round() as i32;
+                        if n != 0 {
+                            let _ = enigo.key(Key::Control, Direction::Press);
+                            let _ = enigo.scroll(n, Axis::Vertical);
+                            let _ = enigo.key(Key::Control, Direction::Release);
+                        }
                     }
                     Cmd::Click(button, double) => {
                         #[cfg(windows)]
@@ -123,6 +133,7 @@ impl Input {
                     get_f64(frame, "dy").unwrap_or(0.0),
                     get_f64(frame, "scroll").unwrap_or(0.0),
                 )),
+                "input.zoom" => Some(Cmd::Zoom(get_f64(frame, "ticks").unwrap_or(0.0))),
                 "input.point" => Some(Cmd::Point(
                     get_f64(frame, "x").unwrap_or(0.0),
                     get_f64(frame, "y").unwrap_or(0.0),

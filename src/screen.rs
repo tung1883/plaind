@@ -16,7 +16,7 @@ impl ScreenStream {
     pub fn start(ch: i64, max_w: u32, fps: i64, draw_cur: bool, tx: Sender<rmpv::Value>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let period = Duration::from_millis((1000 / fps.clamp(1, 30)) as u64);
+        let period = Duration::from_millis((1000 / fps.clamp(1, 60)) as u64);
         std::thread::spawn(move || {
             let monitor = xcap::Monitor::all()
                 .ok()
@@ -26,14 +26,18 @@ impl ScreenStream {
             };
             let mon_x = monitor.x();
             let mon_y = monitor.y();
+            let mut report = std::time::Instant::now();
             while !flag.load(Ordering::Relaxed) {
                 let t0 = std::time::Instant::now();
                 if let Ok(shot) = monitor.capture_image() {
+                    let t_cap = t0.elapsed();
                     let (w, h) = (shot.width(), shot.height());
                     let raw = shot.into_raw();
                     if let Some(img) = image::RgbaImage::from_raw(w, h, raw) {
                         let (sw, sh) = (w, h);
+                        let t1 = std::time::Instant::now();
                         let mut img = downscale(img, max_w.max(320));
+                        let t_scale = t1.elapsed();
                         let sx = img.width() as f64 / w as f64;
                         let sy = img.height() as f64 / h as f64;
                         if draw_cur {
@@ -45,9 +49,22 @@ impl ScreenStream {
                             }
                         }
                         let (fw, fh) = (img.width(), img.height());
+                        let t2 = std::time::Instant::now();
                         let jpeg = encode_jpeg(img);
-                        if tx.blocking_send(screen_frame(ch, fw, fh, sw, sh, jpeg)).is_err() {
-                            break;
+                        let t_enc = t2.elapsed();
+                        if report.elapsed() >= Duration::from_secs(2) {
+                            report = std::time::Instant::now();
+                            eprintln!(
+                                "[screen] cap {:?}  scale {:?}  enc {:?}  jpeg {}KB  {}x{}",
+                                t_cap, t_scale, t_enc, jpeg.len() / 1024, fw, fh
+                            );
+                        }
+                        // Never queue frames: if the writer/link is behind, drop
+                        // this one so the client always gets the freshest, not a
+                        // backlog (that backlog is the 0.3-0.5s of lag).
+                        match tx.try_send(screen_frame(ch, fw, fh, sw, sh, jpeg)) {
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                            _ => {}
                         }
                     }
                 }
@@ -81,8 +98,25 @@ fn downscale(img: image::RgbaImage, max_w: u32) -> image::RgbaImage {
     if img.width() <= max_w {
         return img;
     }
-    let h = (img.height() as u64 * max_w as u64 / img.width() as u64) as u32;
-    image::imageops::resize(&img, max_w, h.max(1), image::imageops::FilterType::Triangle)
+    use fast_image_resize::images::Image;
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+    let (w, h) = (img.width(), img.height());
+    let dw = max_w;
+    let dh = ((h as u64 * dw as u64 / w as u64) as u32).max(1);
+
+    let src = match Image::from_vec_u8(w, h, img.into_raw(), PixelType::U8x4) {
+        Ok(s) => s,
+        Err(_) => return image::RgbaImage::new(dw, dh),
+    };
+    let mut dst = Image::new(dw, dh, PixelType::U8x4);
+    let mut resizer = Resizer::new();
+    let _ = resizer.resize(
+        &src,
+        &mut dst,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
+    );
+    image::RgbaImage::from_raw(dw, dh, dst.into_vec()).unwrap_or_else(|| image::RgbaImage::new(dw, dh))
 }
 
 #[cfg(all(feature = "screen", windows))]
@@ -164,9 +198,10 @@ fn draw_cursor(img: &mut image::RgbaImage, cx: i32, cy: i32, c: i32) {
 
 #[cfg(feature = "screen")]
 fn encode_jpeg(img: image::RgbaImage) -> Vec<u8> {
-    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
-    let mut out = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 55);
-    let _ = encoder.encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8);
+    // SIMD encoder, straight from RGBA (skips the RGBA->RGB copy the image crate needs).
+    let (w, h) = (img.width() as u16, img.height() as u16);
+    let mut out = Vec::with_capacity(96 * 1024);
+    let enc = jpeg_encoder::Encoder::new(&mut out, 50);
+    let _ = enc.encode(&img.into_raw(), w, h, jpeg_encoder::ColorType::Rgba);
     out
 }

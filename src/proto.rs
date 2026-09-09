@@ -5,7 +5,7 @@ use rmpv::Value;
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROTO: i64 = 1;
+pub const PROTO: i64 = 2;
 pub const DEFAULT_PORT: u16 = 8471;
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -136,6 +136,47 @@ pub fn pty_exit(ch: i64, code: i64) -> Value {
     ])
 }
 
+pub fn session_list(ch: i64, items: Vec<crate::pty::SessionInfo>) -> Value {
+    let arr = items
+        .into_iter()
+        .map(|i| {
+            map(vec![
+                ("id", Value::from(i.id)),
+                ("name", s(&i.name)),
+                ("cols", Value::from(i.cols)),
+                ("rows", Value::from(i.rows)),
+                ("alive", Value::Boolean(i.alive)),
+                ("created_ms", Value::from(i.created_ms)),
+            ])
+        })
+        .collect();
+    map(vec![
+        ("t", s("session.list")),
+        ("ch", Value::from(ch)),
+        ("sessions", Value::Array(arr)),
+    ])
+}
+
+pub fn session_gone(ch: i64, id: u64) -> Value {
+    map(vec![
+        ("t", s("session.gone")),
+        ("ch", Value::from(ch)),
+        ("id", Value::from(id)),
+    ])
+}
+
+pub fn session_opened(ch: i64, id: u64, name: &str, cols: i64, rows: i64, alive: bool) -> Value {
+    map(vec![
+        ("t", s("session.opened")),
+        ("ch", Value::from(ch)),
+        ("id", Value::from(id)),
+        ("name", s(name)),
+        ("cols", Value::from(cols)),
+        ("rows", Value::from(rows)),
+        ("alive", Value::Boolean(alive)),
+    ])
+}
+
 pub fn screen_frame(ch: i64, w: u32, h: u32, sw: u32, sh: u32, jpeg: Vec<u8>) -> Value {
     map(vec![
         ("t", s("screen.frame")),
@@ -152,11 +193,12 @@ pub fn screen_frame(ch: i64, w: u32, h: u32, sw: u32, sh: u32, jpeg: Vec<u8>) ->
     ])
 }
 
-pub fn proc_list(ch: i64, procs: Vec<Value>) -> Value {
+pub fn proc_list(ch: i64, procs: Vec<Value>, sys: Value) -> Value {
     map(vec![
         ("t", s("proc.list")),
         ("ch", Value::from(ch)),
         ("procs", Value::Array(procs)),
+        ("sys", sys),
     ])
 }
 

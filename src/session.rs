@@ -13,7 +13,7 @@ use crate::input::Input;
 use crate::pairing;
 use crate::proto;
 use crate::procs::Procs;
-use crate::pty::PtyChannel;
+use crate::pty::sessions;
 use crate::screen::ScreenStream;
 
 pub async fn handle(stream: TcpStream, peer: SocketAddr) {
@@ -26,7 +26,10 @@ async fn run(stream: TcpStream, peer: SocketAddr) -> Result<()> {
     stream.set_nodelay(true).ok();
     let (mut rd, mut wr) = stream.into_split();
 
-    let (tx, mut rx) = mpsc::channel::<Value>(512);
+    // Small on purpose: screen frames must not pile up here (they use try_send
+    // and drop when it's full), and pty output is tiny — a deep buffer just adds
+    // latency.
+    let (tx, mut rx) = mpsc::channel::<Value>(16);
     let writer = tokio::spawn(async move {
         while let Some(value) = rx.recv().await {
             if proto::write_frame(&mut wr, &value).await.is_err() {
@@ -70,7 +73,7 @@ where
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
     eprintln!("[{peer}] paired device connected: {device}");
 
-    let mut caps = vec!["pty", "proc"];
+    let mut caps = vec!["pty", "session", "proc"];
     if ScreenStream::SUPPORTED {
         caps.push("screen");
     }
@@ -80,7 +83,7 @@ where
     tx.send(proto::welcome(&hostname(), os_name(), &caps)).await.ok();
 
     // Channel state.
-    let mut ptys: HashMap<i64, PtyChannel> = HashMap::new();
+    let mut attached: HashMap<i64, u64> = HashMap::new(); // channel id -> session id
     let mut screens: HashMap<i64, ScreenStream> = HashMap::new();
     let mut procs = Procs::new();
     let input = Input::new();
@@ -91,37 +94,115 @@ where
             "ping" => {
                 tx.send(proto::pong()).await.ok();
             }
+            // Legacy path: an ephemeral session that dies when its channel closes.
             "pty.open" => {
                 let cols = proto::get_i64(&frame, "cols").unwrap_or(80) as u16;
                 let rows = proto::get_i64(&frame, "rows").unwrap_or(24) as u16;
                 let cmd = proto::get_str(&frame, "cmd").map(String::from);
-                match PtyChannel::open(ch, cols, rows, cmd.as_deref(), tx.clone()) {
-                    Ok(channel) => {
-                        ptys.insert(ch, channel);
-                        eprintln!("[{peer}] pty.open ch={ch} {cols}x{rows}");
+                match sessions().create(None, cols, rows, cmd.as_deref(), true) {
+                    Ok(sess) => {
+                        let replay = sess.attach(ch, tx.clone());
+                        attached.insert(ch, sess.id);
+                        if !replay.is_empty() {
+                            tx.send(proto::pty_data(ch, &replay)).await.ok();
+                        }
+                        eprintln!("[{peer}] pty.open ch={ch} -> session {} {cols}x{rows}", sess.id);
                     }
                     Err(e) => {
                         tx.send(chan_error(ch, &format!("pty failed: {e}"))).await.ok();
                     }
                 }
             }
-            "pty.data" => {
-                if let (Some(channel), Some(data)) =
-                    (ptys.get(&ch), proto::get_bin(&frame, "data"))
+            "session.list" => {
+                tx.send(proto::session_list(ch, sessions().list())).await.ok();
+            }
+            // Persistent path: create a named session, or reattach to `id`.
+            "session.open" => {
+                let cols = proto::get_i64(&frame, "cols").unwrap_or(80) as u16;
+                let rows = proto::get_i64(&frame, "rows").unwrap_or(24) as u16;
+                let want = proto::get_i64(&frame, "id").map(|v| v as u64);
+                let sess = match want {
+                    // Reattach: if it's gone (daemon restarted, killed), say so —
+                    // never silently hand back a different shell.
+                    Some(id) => match sessions().get(id) {
+                        Some(s) => s,
+                        None => {
+                            tx.send(proto::session_gone(ch, id)).await.ok();
+                            continue;
+                        }
+                    },
+                    None => {
+                        let name = proto::get_str(&frame, "name").map(String::from);
+                        match sessions().create(name, cols, rows, None, false) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tx.send(chan_error(ch, &format!("shell failed: {e}"))).await.ok();
+                                continue;
+                            }
+                        }
+                    }
+                };
+                sess.resize(cols, rows);
+                let replay = sess.attach(ch, tx.clone());
+                attached.insert(ch, sess.id);
+                let i = sess.info();
+                tx.send(proto::session_opened(ch, i.id, &i.name, i.cols, i.rows, i.alive))
+                    .await
+                    .ok();
+                if !replay.is_empty() {
+                    tx.send(proto::pty_data(ch, &replay)).await.ok();
+                }
+                eprintln!("[{peer}] session.open ch={ch} -> session {} ({})", i.id, i.name);
+            }
+            "session.detach" => {
+                if let Some(id) = attached.remove(&ch) {
+                    if let Some(s) = sessions().get(id) {
+                        s.detach(ch);
+                    }
+                }
+            }
+            "session.kill" => {
+                let id = proto::get_i64(&frame, "id").unwrap_or(0) as u64;
+                if let Some(s) = sessions().get(id) {
+                    s.kill();
+                }
+                sessions().remove(id);
+                if let Some(dead_ch) =
+                    attached.iter().find(|(_, v)| **v == id).map(|(c, _)| *c)
                 {
-                    channel.feed(data);
+                    attached.remove(&dead_ch);
+                    tx.send(proto::pty_exit(dead_ch, -1)).await.ok();
+                }
+            }
+            "pty.data" => {
+                if let (Some(id), Some(data)) =
+                    (attached.get(&ch).copied(), proto::get_bin(&frame, "data"))
+                {
+                    if let Some(s) = sessions().get(id) {
+                        s.feed(data);
+                    }
                 }
             }
             "pty.resize" => {
-                if let Some(channel) = ptys.get(&ch) {
-                    channel.resize(
-                        proto::get_i64(&frame, "cols").unwrap_or(80) as u16,
-                        proto::get_i64(&frame, "rows").unwrap_or(24) as u16,
-                    );
+                if let Some(id) = attached.get(&ch).copied() {
+                    if let Some(s) = sessions().get(id) {
+                        s.resize(
+                            proto::get_i64(&frame, "cols").unwrap_or(80) as u16,
+                            proto::get_i64(&frame, "rows").unwrap_or(24) as u16,
+                        );
+                    }
                 }
             }
             "pty.close" => {
-                ptys.remove(&ch);
+                if let Some(id) = attached.remove(&ch) {
+                    if let Some(s) = sessions().get(id) {
+                        s.detach(ch);
+                        if s.ephemeral {
+                            s.kill();
+                            sessions().remove(id);
+                        }
+                    }
+                }
             }
             "screen.start" => {
                 if !ScreenStream::SUPPORTED {
@@ -137,11 +218,13 @@ where
             "screen.stop" => {
                 screens.remove(&ch);
             }
-            "input.move" | "input.point" | "input.click" | "input.down" | "input.up" | "input.key" => {
+            "input.move" | "input.point" | "input.click" | "input.down" | "input.up"
+            | "input.key" | "input.zoom" => {
                 input.handle(&frame);
             }
             "proc.list" => {
-                tx.send(proto::proc_list(ch, procs.snapshot())).await.ok();
+                let (list, sys) = procs.snapshot();
+                tx.send(proto::proc_list(ch, list, sys)).await.ok();
             }
             "proc.kill" => {
                 let pid = proto::get_i64(&frame, "pid").unwrap_or(0);
@@ -152,6 +235,18 @@ where
             }
             other => {
                 eprintln!("[{peer}] ignoring {other}");
+            }
+        }
+    }
+
+    // Client gone: detach every session it held. Persistent ones keep running
+    // (buffering output for the next reconnect); ephemeral ones are killed.
+    for (ch, id) in attached.drain() {
+        if let Some(s) = sessions().get(id) {
+            s.detach(ch);
+            if s.ephemeral {
+                s.kill();
+                sessions().remove(id);
             }
         }
     }

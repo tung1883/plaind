@@ -20,7 +20,9 @@ qrcode = { version = "0.14", default-features = false }
 dirs = "5"
 local-ip-address = "0.6"
 anyhow = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+fast_image_resize = { version = "5", optional = true }
+jpeg-encoder = { version = "0.6", default-features = false, features = ["simd"], optional = true }
 xcap = { version = "0.0.14", optional = true }
 enigo = { version = "0.3", optional = true }
 
@@ -29,7 +31,7 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "W
 
 [features]
 default = ["screen", "input"]
-screen = ["dep:xcap", "dep:image"]
+screen = ["dep:xcap", "dep:image", "dep:fast_image_resize", "dep:jpeg-encoder"]
 input = ["dep:enigo"]
 
 [profile.release]
