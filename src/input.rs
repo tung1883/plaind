@@ -56,6 +56,7 @@ impl Input {
                         }
                     }
                     Cmd::Click(button, double) => {
+                        crate::plog!("[input] click {button} double={double}");
                         #[cfg(windows)]
                         {
                             raw_button(&button, true);
@@ -159,6 +160,7 @@ impl Input {
                 _ => None,
             };
             if let Some(cmd) = cmd {
+                crate::plog!("[input] {}", msg_type(frame));
                 let _ = self.tx.send(cmd);
             }
         }
