@@ -24,6 +24,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg"], optio
 xcap = { version = "0.0.14", optional = true }
 enigo = { version = "0.3", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Foundation"] }
+
 [features]
 default = ["screen", "input"]
 screen = ["dep:xcap", "dep:image"]

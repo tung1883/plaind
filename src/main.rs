@@ -7,8 +7,25 @@ use anyhow::Result;
 use plaind::{pairing, session};
 use tokio::net::TcpListener;
 
+#[cfg(windows)]
+fn make_dpi_aware() {
+    use windows_sys::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+#[cfg(not(windows))]
+fn make_dpi_aware() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Screen capture, cursor read and pointer move must all share one pixel
+    // space; without this they disagree under display scaling.
+    make_dpi_aware();
+
     let args: Vec<String> = std::env::args().collect();
     let port: u16 = std::env::var("PLAIND_PORT")
         .ok()

@@ -129,14 +129,15 @@ where
                 } else {
                     let max_w = proto::get_i64(&frame, "max_w").unwrap_or(1280) as u32;
                     let fps = proto::get_i64(&frame, "fps").unwrap_or(5);
-                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, tx.clone()));
-                    eprintln!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps}");
+                    let cursor = proto::get(&frame, "cursor").and_then(|v| v.as_bool()).unwrap_or(true);
+                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, tx.clone()));
+                    eprintln!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor}");
                 }
             }
             "screen.stop" => {
                 screens.remove(&ch);
             }
-            "input.move" | "input.click" | "input.down" | "input.up" | "input.key" => {
+            "input.move" | "input.point" | "input.click" | "input.down" | "input.up" | "input.key" => {
                 input.handle(&frame);
             }
             "proc.list" => {

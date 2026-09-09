@@ -136,12 +136,16 @@ pub fn pty_exit(ch: i64, code: i64) -> Value {
     ])
 }
 
-pub fn screen_frame(ch: i64, w: u32, h: u32, jpeg: Vec<u8>) -> Value {
+pub fn screen_frame(ch: i64, w: u32, h: u32, sw: u32, sh: u32, jpeg: Vec<u8>) -> Value {
     map(vec![
         ("t", s("screen.frame")),
         ("ch", Value::from(ch)),
         ("w", Value::from(w)),
         ("h", Value::from(h)),
+        // Full source-monitor pixel size, before any downscale — the phone
+        // needs it to draw its cursor at the real pointer's apparent size.
+        ("sw", Value::from(sw)),
+        ("sh", Value::from(sh)),
         ("format", s("jpeg")),
         ("full", Value::Boolean(true)),
         ("data", Value::Binary(jpeg)),
