@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::input::Input;
+use crate::metrics::Metrics;
 use crate::pairing;
 use crate::proto;
 use crate::procs::Procs;
@@ -79,7 +80,7 @@ where
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
     crate::plog!("[{peer}] paired device connected: {device}");
 
-    let mut caps = vec!["pty", "session", "proc"];
+    let mut caps = vec!["pty", "session", "proc", "metrics"];
     if ScreenStream::SUPPORTED {
         caps.push("screen");
     }
@@ -92,6 +93,7 @@ where
     let mut attached: HashMap<i64, u64> = HashMap::new(); // channel id -> session id
     let mut screens: HashMap<i64, ScreenStream> = HashMap::new();
     let mut procs = Procs::new();
+    let mut metrics = Metrics::new();
     let input = Input::new();
 
     while let Some(frame) = proto::read_frame(rd).await? {
@@ -159,6 +161,13 @@ where
                     tx.send(proto::pty_data(ch, &replay)).await.ok();
                 }
                 crate::plog!("[{peer}] session.open ch={ch} -> session {} ({})", i.id, i.name);
+            }
+            "session.rename" => {
+                let id = proto::get_i64(&frame, "id").unwrap_or(0) as u64;
+                if let (Some(s), Some(name)) = (sessions().get(id), proto::get_str(&frame, "name")) {
+                    s.rename(name);
+                }
+                tx.send(proto::session_list(ch, sessions().list())).await.ok();
             }
             "session.detach" => {
                 if let Some(id) = attached.remove(&ch) {
@@ -238,6 +247,18 @@ where
                 let ok = procs.kill(pid, sig);
                 crate::plog!("[{peer}] proc.kill pid={pid} sig={sig} ok={ok}");
                 tx.send(proto::proc_killed(ch, pid, ok)).await.ok();
+            }
+            "stats.get" => {
+                let v = metrics.stats_snapshot();
+                tx.send(proto::stats(ch, v)).await.ok();
+            }
+            "net.get" => {
+                let v = metrics.net_snapshot();
+                tx.send(proto::net(ch, v)).await.ok();
+            }
+            "disk.get" => {
+                let v = metrics.disk_snapshot();
+                tx.send(proto::disk(ch, v)).await.ok();
             }
             other => {
                 crate::plog!("[{peer}] ignoring {other}");

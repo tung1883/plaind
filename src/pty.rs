@@ -28,7 +28,7 @@ struct Bound {
 
 pub struct Session {
     pub id: u64,
-    pub name: String,
+    pub name: Mutex<String>,
     /// Ephemeral sessions (the legacy `pty.open` path) die when their channel closes.
     pub ephemeral: bool,
     created_ms: i64,
@@ -89,10 +89,17 @@ impl Session {
         }
     }
 
+    pub fn rename(&self, name: &str) {
+        let n = name.trim();
+        if !n.is_empty() {
+            *self.name.lock().unwrap() = n.to_string();
+        }
+    }
+
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             id: self.id,
-            name: self.name.clone(),
+            name: self.name.lock().unwrap().clone(),
             cols: self.cols.load(Ordering::Relaxed),
             rows: self.rows.load(Ordering::Relaxed),
             alive: self.alive.load(Ordering::Relaxed),
@@ -164,7 +171,7 @@ impl Sessions {
         let alive = Arc::new(AtomicBool::new(true));
         let session = Arc::new(Session {
             id,
-            name,
+            name: Mutex::new(name),
             ephemeral,
             created_ms: now_ms(),
             cols: AtomicI64::new(c as i64),

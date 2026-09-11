@@ -210,3 +210,24 @@ pub fn proc_killed(ch: i64, pid: i64, ok: bool) -> Value {
         ("ok", Value::Boolean(ok)),
     ])
 }
+
+/// Prepend `t` and `ch` to a body map built by the metrics module.
+fn channelled(t: &str, ch: i64, body: Value) -> Value {
+    let mut pairs = vec![(s("t"), s(t)), (s("ch"), Value::from(ch))];
+    if let Value::Map(inner) = body {
+        pairs.extend(inner);
+    }
+    Value::Map(pairs)
+}
+
+pub fn stats(ch: i64, body: Value) -> Value {
+    channelled("stats", ch, body)
+}
+
+pub fn net(ch: i64, body: Value) -> Value {
+    channelled("net", ch, body)
+}
+
+pub fn disk(ch: i64, body: Value) -> Value {
+    channelled("disk", ch, body)
+}

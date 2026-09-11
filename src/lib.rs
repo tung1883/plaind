@@ -5,6 +5,7 @@
 pub mod plog;
 pub mod autostart;
 pub mod input;
+pub mod metrics;
 pub mod pairing;
 pub mod paths;
 pub mod proto;

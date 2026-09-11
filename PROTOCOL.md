@@ -17,7 +17,7 @@
 | D→C | `{t:"welcome", proto:2, host, os:"linux\|macos\|windows", caps}` |
 | D→C | `{t:"error", code:"auth", msg}` then close — bad token |
 
-- `caps` ⊆ `["pty","session","proc","screen","input"]` (`screen`/`input` are build-time).
+- `caps` ⊆ `["pty","session","proc","metrics","screen","input"]` (`screen`/`input` are build-time).
 - Client pings `{t:"ping"}` every 15 s → `{t:"pong"}`. 20 s silence = dead.
 
 ## Channels
@@ -40,6 +40,7 @@ last 256 KB of output and replays it on reattach.
 | D→C | `{t:"session.gone", ch, id}` — reply to `session.open {id}` for an id the daemon no longer has (restarted / killed); nothing is created |
 | C→D | `{t:"session.detach", ch}` — unbind; the shell keeps running |
 | C→D | `{t:"session.kill", ch, id}` — terminate the shell |
+| C→D | `{t:"session.rename", ch, id, name}` — rename a persistent shell; daemon replies `session.list` |
 | C↔D | `{t:"pty.data", ch, data:<bin>}` — output / keystrokes for the bound session |
 | C→D | `{t:"pty.resize", ch, cols, rows}` |
 | D→C | `{t:"pty.exit", ch, code}` |
@@ -94,6 +95,27 @@ PageUp PageDown Space ctrl-alt-delete`. `mods` are held around `text`/`key`.
 `sys` = `{cpu (0–100), cpu_count, mem_used_kb, mem_total_kb, swap_used_kb,
 swap_total_kb, load:[1m,5m,15m], uptime_s,
 tasks:{total,running,sleeping,stopped,zombie,other}}` (`load` is zeros on Windows).
+
+### metrics — stats / net / disk
+
+Advertised as the `metrics` capability; it implies the three requests below.
+All poll-response, like `proc.list`: the phone asks on a timer and stops while
+its panel is hidden. `PROTO` stays `2` — these are additive, so an older phone
+simply never sends them.
+
+| dir | message |
+|---|---|
+| C→D | `{t:"stats.get", ch}` |
+| D→C | `{t:"stats", ch, cpu (0–100), cpu_count, per_cpu:[0–100…], mem_used_kb, mem_total_kb, swap_used_kb, swap_total_kb, cpu_hist:[…], mem_hist:[…], load:[1m,5m,15m], uptime_s, boot_s}` |
+| C→D | `{t:"net.get", ch}` |
+| D→C | `{t:"net", ch, ifaces:[{name, rx_bps, tx_bps, rx_total, tx_total, mac, mtu, addrs:["ip/prefix"…]}], rx_total, tx_total, ports:[{proto:"tcp\|udp", addr, port, pids:[…]}]}` |
+| C→D | `{t:"disk.get", ch}` |
+| D→C | `{t:"disk", ch, disks:[{mount, name, fs, kind, total, avail, used, read_bps, write_bps, read_total, write_total}]}` |
+
+`cpu_hist` / `mem_hist` are newest-last percent ring buffers (≤120 samples) kept
+per connection — a reconnect restarts them. All byte counts are bytes; `*_bps`
+is bytes since the previous poll for that channel. `load` is zeros on Windows.
+Listening ports come from `netstat2` (TCP in `LISTEN` plus all UDP).
 
 ## Errors
 
