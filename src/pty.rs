@@ -240,6 +240,11 @@ fn spawn_shell(
         b.arg("-s");
         b.arg(format!("plain_{safe}"));
         b.env("TERM", "xterm-256color");
+        b.env("COLORTERM", "truecolor");
+        // The daemon's own environment (whatever launched plaind, e.g. a
+        // terminal with color output piped/captured elsewhere) shouldn't leak
+        // into every remote shell and silently disable color there too.
+        b.env_remove("NO_COLOR");
         if let Some(home) = dirs::home_dir() {
             b.cwd(home);
         }
@@ -258,6 +263,8 @@ fn spawn_shell(
         _ => CommandBuilder::new(default_shell()),
     };
     builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    builder.env_remove("NO_COLOR");
     if let Some(home) = dirs::home_dir() {
         builder.cwd(home);
     }

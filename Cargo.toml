@@ -13,8 +13,10 @@ path = "src/main.rs"
 winresource = "0.1"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
 rmpv = "1"
+walkdir = "2"
+sha2 = "0.10"
 sysinfo = "0.33"
 portable-pty = "0.8"
 base64 = "0.22"
@@ -24,6 +26,7 @@ dirs = "5"
 local-ip-address = "0.6"
 netstat2 = "0.9"
 anyhow = "1"
+arboard = "3"
 image = { version = "0.25", default-features = false, optional = true }
 fast_image_resize = { version = "5", optional = true }
 jpeg-encoder = { version = "0.6", default-features = false, features = ["simd"], optional = true }

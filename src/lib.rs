@@ -4,6 +4,8 @@
 #[macro_use]
 pub mod plog;
 pub mod autostart;
+pub mod clip;
+pub mod filesync;
 pub mod input;
 pub mod metrics;
 pub mod pairing;

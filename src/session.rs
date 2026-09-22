@@ -10,6 +10,8 @@ use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
+use crate::clip;
+use crate::filesync::{self, PutState};
 use crate::input::Input;
 use crate::metrics::Metrics;
 use crate::pairing;
@@ -80,7 +82,7 @@ where
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
     crate::plog!("[{peer}] paired device connected: {device}");
 
-    let mut caps = vec!["pty", "session", "proc", "metrics"];
+    let mut caps = vec!["pty", "session", "proc", "metrics", "clip", "sync"];
     if ScreenStream::SUPPORTED {
         caps.push("screen");
     }
@@ -95,6 +97,9 @@ where
     let mut procs = Procs::new();
     let mut metrics = Metrics::new();
     let input = Input::new();
+    let mut clip_watches: HashMap<i64, clip::Watch> = HashMap::new();
+    let clip_last = clip::new_last_seen();
+    let mut puts: HashMap<i64, PutState> = HashMap::new();
 
     while let Some(frame) = proto::read_frame(rd).await? {
         let ch = proto::get_i64(&frame, "ch").unwrap_or(-1);
@@ -259,6 +264,87 @@ where
             "disk.get" => {
                 let v = metrics.disk_snapshot();
                 tx.send(proto::disk(ch, v)).await.ok();
+            }
+            "clip.watch" => {
+                clip_watches.insert(ch, clip::Watch::start(ch, tx.clone(), clip_last.clone()));
+                if let Some(text) = clip::get_text() {
+                    tx.send(proto::clip(ch, &text)).await.ok();
+                }
+            }
+            "clip.stop" => {
+                clip_watches.remove(&ch);
+            }
+            "clip.get" => {
+                let text = clip::get_text().unwrap_or_default();
+                tx.send(proto::clip(ch, &text)).await.ok();
+            }
+            "clip.set" => {
+                if let Some(text) = proto::get_str(&frame, "text") {
+                    clip::set_text(text, &clip_last);
+                }
+            }
+            "fs.list" => {
+                let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
+                if let Ok(v) = tokio::task::spawn_blocking(move || filesync::fs_list(ch, path)).await {
+                    tx.send(v).await.ok();
+                }
+            }
+            "sync.list" => {
+                let root = proto::get_str(&frame, "root").unwrap_or_default().to_string();
+                let hash = proto::get_bool(&frame, "hash");
+                let tx = tx.clone();
+                if let Ok(entries) = tokio::task::spawn_blocking(move || filesync::sync_list(root, hash)).await {
+                    tx.send(proto::sync_list(ch, entries)).await.ok();
+                }
+            }
+            "sync.put.begin" => {
+                let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
+                let outcome = tokio::task::spawn_blocking(move || PutState::begin(&path)).await;
+                match outcome {
+                    Ok(Ok((state, resume_offset))) => {
+                        puts.insert(ch, state);
+                        tx.send(proto::sync_put_ready(ch, resume_offset)).await.ok();
+                    }
+                    _ => {
+                        tx.send(chan_error(ch, "sync.put.begin failed")).await.ok();
+                    }
+                }
+            }
+            "sync.put.chunk" => {
+                if let (Some(state), Some(offset), Some(data)) = (
+                    puts.get_mut(&ch),
+                    proto::get_i64(&frame, "offset"),
+                    proto::get_bin(&frame, "data"),
+                ) {
+                    // Bounded to CHUNK_SIZE (256 KiB) by the client — a plain
+                    // in-loop write is cheap enough not to need spawn_blocking,
+                    // same as the small synchronous fs calls already used above.
+                    if state.write_chunk(offset.max(0) as u64, data).is_err() {
+                        puts.remove(&ch);
+                        tx.send(chan_error(ch, "sync.put.chunk failed")).await.ok();
+                    }
+                }
+            }
+            "sync.put.end" => {
+                if let Some(state) = puts.remove(&ch) {
+                    let ok = tokio::task::spawn_blocking(move || state.finish())
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+                    tx.send(proto::sync_put_done(ch, ok, if ok { None } else { Some("write failed") }))
+                        .await
+                        .ok();
+                }
+            }
+            "sync.delete" => {
+                let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
+                let ok = tokio::task::spawn_blocking(move || filesync::delete(&path)).await.unwrap_or(false);
+                tx.send(proto::sync_delete_done(ch, ok)).await.ok();
+            }
+            "sync.get.begin" => {
+                let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
+                let resume_offset = proto::get_i64(&frame, "resume_offset").unwrap_or(0).max(0) as u64;
+                tokio::spawn(filesync::send_file(ch, path, resume_offset, tx.clone()));
             }
             other => {
                 crate::plog!("[{peer}] ignoring {other}");

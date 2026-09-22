@@ -17,7 +17,7 @@
 | D→C | `{t:"welcome", proto:2, host, os:"linux\|macos\|windows", caps}` |
 | D→C | `{t:"error", code:"auth", msg}` then close — bad token |
 
-- `caps` ⊆ `["pty","session","proc","metrics","screen","input"]` (`screen`/`input` are build-time).
+- `caps` ⊆ `["pty","session","proc","metrics","clip","sync","screen","input"]` (`screen`/`input` are build-time).
 - Client pings `{t:"ping"}` every 15 s → `{t:"pong"}`. 20 s silence = dead.
 
 ## Channels
@@ -116,6 +116,53 @@ simply never sends them.
 per connection — a reconnect restarts them. All byte counts are bytes; `*_bps`
 is bytes since the previous poll for that channel. `load` is zeros on Windows.
 Listening ports come from `netstat2` (TCP in `LISTEN` plus all UDP).
+
+### clipboard
+
+Advertised as the `clip` capability. `ch` here is a long-lived "watch" channel,
+not a request/response pair like `metrics` — open it once and it stays live.
+
+| dir | message |
+|---|---|
+| C→D | `{t:"clip.watch", ch}` — daemon replies once with the clipboard's current text, then pushes `clip` again whenever the **PC's** clipboard changes |
+| D→C | `{t:"clip", ch, text}` |
+| C→D | `{t:"clip.stop", ch}` — stop watching |
+| C→D | `{t:"clip.get", ch}` — one-shot read (used for a fallback poll if a push might have been missed) |
+| C→D | `{t:"clip.set", ch, text}` — write the phone's clipboard into the PC's |
+
+A `clip.set` updates the daemon's own change-baseline so it doesn't immediately
+echo the same text back out through `clip.watch` as if the PC had changed it.
+The watcher polls every 800 ms (no OS-level clipboard-changed hook is used, to
+stay cross-platform) — so PC→phone updates land within ~1 s, not instantly.
+
+### file sync
+
+Advertised as the `sync` capability. `PROTO` stays `2` — additive, same as
+`metrics`. Every path (`root`, `path`) is an absolute path on the daemon's
+own filesystem; the client resolves a pair's relative file paths against
+its remembered remote root before sending them. Resumability is
+disk-based, not tracked in daemon memory: an upload writes into a
+`<name>.partial` sibling of the destination file, and the client always
+asks how many bytes of it already exist before sending more, so a run
+survives a daemon restart, not just a dropped connection.
+
+| dir | message |
+|---|---|
+| C→D | `{t:"fs.list", ch, path}` — one directory's immediate children, for a remote-folder picker |
+| D→C | `{t:"fs.list", ch, entries:[{name, is_dir}]}` |
+| C→D | `{t:"sync.list", ch, root, hash?:bool}` — recursive listing of one root; `hash` only when the pair's detect mode is checksum (hashing every file is expensive, so the client only asks for it when it needs it) |
+| D→C | `{t:"sync.list", ch, entries:[{path, size, mtime_ms, sha256?}]}` — `path` is relative to `root`, forward-slashed |
+| C→D | `{t:"sync.put.begin", ch, path, size, mtime_ms}` — upload, phone → daemon |
+| D→C | `{t:"sync.put.ready", ch, resume_offset}` — bytes of `<path>.partial` already on disk; the client resumes from here, not necessarily 0 |
+| C→D | `{t:"sync.put.chunk", ch, offset, data:<bin>}` × N, ≤256 KiB each |
+| C→D | `{t:"sync.put.end", ch}` — daemon renames `.partial` into place |
+| D→C | `{t:"sync.put.done", ch, ok, msg?}` |
+| C→D | `{t:"sync.get.begin", ch, path, resume_offset}` — download, daemon → phone; `resume_offset` is how much of its own local partial the phone already has |
+| D→C | `{t:"sync.get.meta", ch, size, mtime_ms}` |
+| D→C | `{t:"sync.get.chunk", ch, offset, data:<bin>}` × N, ≤256 KiB each |
+| D→C | `{t:"sync.get.end", ch, ok}` |
+| C→D | `{t:"sync.delete", ch, path}` — mirror cleanup, only sent when a pair has delete-propagation on |
+| D→C | `{t:"sync.delete.done", ch, ok}` |
 
 ## Errors
 

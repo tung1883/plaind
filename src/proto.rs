@@ -231,3 +231,106 @@ pub fn net(ch: i64, body: Value) -> Value {
 pub fn disk(ch: i64, body: Value) -> Value {
     channelled("disk", ch, body)
 }
+
+pub fn clip(ch: i64, text: &str) -> Value {
+    map(vec![
+        ("t", s("clip")),
+        ("ch", Value::from(ch)),
+        ("text", s(text)),
+    ])
+}
+
+// --- file sync ---------------------------------------------------------------
+
+pub fn fs_list(ch: i64, entries: Vec<(String, bool)>) -> Value {
+    let arr = entries
+        .into_iter()
+        .map(|(name, is_dir)| map(vec![("name", s(&name)), ("is_dir", Value::Boolean(is_dir))]))
+        .collect();
+    map(vec![
+        ("t", s("fs.list")),
+        ("ch", Value::from(ch)),
+        ("entries", Value::Array(arr)),
+    ])
+}
+
+/// One `sync.list` entry: a file under the walked root. `sha256` is only
+/// populated when the request asked for content hashing (checksum detect mode).
+pub struct SyncEntry {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub sha256: Option<String>,
+}
+
+pub fn sync_list(ch: i64, entries: Vec<SyncEntry>) -> Value {
+    let arr = entries
+        .into_iter()
+        .map(|e| {
+            let mut pairs = vec![
+                ("path", s(&e.path)),
+                ("size", Value::from(e.size)),
+                ("mtime_ms", Value::from(e.mtime_ms)),
+            ];
+            if let Some(h) = &e.sha256 {
+                pairs.push(("sha256", s(h)));
+            }
+            map(pairs)
+        })
+        .collect();
+    map(vec![
+        ("t", s("sync.list")),
+        ("ch", Value::from(ch)),
+        ("entries", Value::Array(arr)),
+    ])
+}
+
+pub fn sync_put_ready(ch: i64, resume_offset: u64) -> Value {
+    map(vec![
+        ("t", s("sync.put.ready")),
+        ("ch", Value::from(ch)),
+        ("resume_offset", Value::from(resume_offset)),
+    ])
+}
+
+pub fn sync_put_done(ch: i64, ok: bool, msg: Option<&str>) -> Value {
+    let mut pairs = vec![("t", s("sync.put.done")), ("ch", Value::from(ch)), ("ok", Value::Boolean(ok))];
+    if let Some(m) = msg {
+        pairs.push(("msg", s(m)));
+    }
+    map(pairs)
+}
+
+pub fn sync_get_meta(ch: i64, size: u64, mtime_ms: i64) -> Value {
+    map(vec![
+        ("t", s("sync.get.meta")),
+        ("ch", Value::from(ch)),
+        ("size", Value::from(size)),
+        ("mtime_ms", Value::from(mtime_ms)),
+    ])
+}
+
+pub fn sync_get_chunk(ch: i64, offset: u64, data: &[u8]) -> Value {
+    map(vec![
+        ("t", s("sync.get.chunk")),
+        ("ch", Value::from(ch)),
+        ("offset", Value::from(offset)),
+        ("data", Value::Binary(data.to_vec())),
+    ])
+}
+
+pub fn sync_get_end(ch: i64, ok: bool) -> Value {
+    map(vec![
+        ("t", s("sync.get.end")),
+        ("ch", Value::from(ch)),
+        ("ok", Value::Boolean(ok)),
+    ])
+}
+
+pub fn sync_delete_done(ch: i64, ok: bool) -> Value {
+    map(vec![
+        ("t", s("sync.delete.done")),
+        ("ch", Value::from(ch)),
+        ("ok", Value::Boolean(ok)),
+    ])
+}
