@@ -9,14 +9,26 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
 
-use crate::proto::{pty_data, pty_exit};
+use crate::proto::{pty_ack, pty_data_ack, pty_exit};
 
 /// Bytes of recent output kept for a reconnecting client to repaint from.
 const BUFFER_CAP: usize = 256 * 1024;
+/// How long the shell gets to answer a keystroke before the client may treat
+/// the screen as reflecting it (mosh uses the same 50 ms).
+const ECHO_WAIT: Duration = Duration::from_millis(50);
+
+/// Echo-ack bookkeeping: client input sequence numbers not yet reported.
+#[derive(Default)]
+struct Echo {
+    /// (seq, fed at), oldest first.
+    inputs: VecDeque<(u64, Instant)>,
+    /// Highest seq already reported to the client.
+    reported: u64,
+}
 
 type Frame = rmpv::Value;
 
@@ -40,6 +52,13 @@ pub struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     buffer: Mutex<VecDeque<u8>>,
     bound: Mutex<Option<Bound>>,
+    /// When the oldest keystroke not yet answered by pty output arrived.
+    input_at: Mutex<Option<std::time::Instant>>,
+    echo: Mutex<Echo>,
+    echo_cv: Condvar,
+    /// Held while reading-then-sending output and while sending a bare ack,
+    /// so an ack never overtakes output read before it.
+    send_lock: Mutex<()>,
 }
 
 pub struct SessionInfo {
@@ -52,6 +71,41 @@ pub struct SessionInfo {
 }
 
 impl Session {
+    /// A keystroke arrived from the client (for the shell's own echo time).
+    pub fn mark_input(&self) {
+        let mut t = self.input_at.lock().unwrap();
+        if t.is_none() {
+            *t = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Input `seq` (client-numbered) was just fed to the shell.
+    pub fn note_input(&self, seq: u64) {
+        self.echo.lock().unwrap().inputs.push_back((seq, Instant::now()));
+        self.echo_cv.notify_one();
+    }
+
+    /// Highest input seq fed at least `ECHO_WAIT` ago and not yet reported.
+    fn ack_due(&self) -> Option<u64> {
+        let mut e = self.echo.lock().unwrap();
+        let now = Instant::now();
+        let mut due = None;
+        while let Some(&(seq, at)) = e.inputs.front() {
+            if now.duration_since(at) < ECHO_WAIT {
+                break;
+            }
+            e.inputs.pop_front();
+            due = Some(seq);
+        }
+        match due {
+            Some(seq) if seq > e.reported => {
+                e.reported = seq;
+                Some(seq)
+            }
+            _ => None,
+        }
+    }
+
     /// Feed keystrokes into the shell.
     pub fn feed(&self, data: &[u8]) {
         if let Ok(mut w) = self.writer.lock() {
@@ -72,6 +126,8 @@ impl Session {
     /// Bind a channel and return a snapshot of the output buffer for replay.
     pub fn attach(&self, ch: i64, tx: Sender<Frame>) -> Vec<u8> {
         *self.bound.lock().unwrap() = Some(Bound { ch, tx });
+        // a new client numbers its input from scratch
+        *self.echo.lock().unwrap() = Echo::default();
         self.buffer.lock().unwrap().iter().copied().collect()
     }
 
@@ -182,6 +238,10 @@ impl Sessions {
             killer: Mutex::new(killer),
             buffer: Mutex::new(VecDeque::new()),
             bound: Mutex::new(None),
+            input_at: Mutex::new(None),
+            echo: Mutex::new(Echo::default()),
+            echo_cv: Condvar::new(),
+            send_lock: Mutex::new(()),
         });
         self.map.lock().unwrap().insert(id, session.clone());
 
@@ -203,8 +263,16 @@ impl Sessions {
                                 b.drain(..over);
                             }
                         }
+                        if let Some(t) = s.input_at.lock().unwrap().take() {
+                            // keystroke in -> shell/ConPTY output out, on the PC alone
+                            crate::latstat::record("d.shell_echo", crate::latstat::ms(t.elapsed()));
+                        }
+                        let _order = s.send_lock.lock().unwrap();
                         if let Some(bd) = s.bound.lock().unwrap().as_ref() {
-                            let _ = bd.tx.blocking_send(pty_data(bd.ch, chunk));
+                            let t0 = std::time::Instant::now();
+                            let _ = bd.tx.blocking_send(pty_data_ack(bd.ch, chunk, s.ack_due()));
+                            // waiting for room in the connection's send queue
+                            crate::latstat::record("d.pty_enqueue", crate::latstat::ms(t0.elapsed()));
                         }
                     }
                 }
@@ -215,6 +283,32 @@ impl Sessions {
                 let _ = bd.tx.blocking_send(pty_exit(bd.ch, code));
             }
             sessions().remove(s.id);
+        });
+
+        // Ack pump: reports input the shell answered with no output at all
+        // (or whose output came before ECHO_WAIT was up).
+        let s = session.clone();
+        std::thread::spawn(move || loop {
+            let due_at = {
+                let mut e = s.echo.lock().unwrap();
+                while e.inputs.is_empty() && s.alive.load(Ordering::Relaxed) {
+                    e = s.echo_cv.wait_timeout(e, Duration::from_millis(500)).unwrap().0;
+                }
+                if !s.alive.load(Ordering::Relaxed) {
+                    return;
+                }
+                e.inputs.front().map(|&(_, at)| at + ECHO_WAIT).unwrap()
+            };
+            let now = Instant::now();
+            if due_at > now {
+                std::thread::sleep(due_at - now);
+            }
+            let _order = s.send_lock.lock().unwrap();
+            if let Some(seq) = s.ack_due() {
+                if let Some(bd) = s.bound.lock().unwrap().as_ref() {
+                    let _ = bd.tx.blocking_send(pty_ack(bd.ch, seq));
+                }
+            }
         });
 
         Ok(session)

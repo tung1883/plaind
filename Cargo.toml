@@ -27,7 +27,6 @@ local-ip-address = "0.6"
 netstat2 = "0.9"
 anyhow = "1"
 arboard = "3"
-image = { version = "0.25", default-features = false, optional = true }
 fast_image_resize = { version = "5", optional = true }
 jpeg-encoder = { version = "0.6", default-features = false, features = ["simd"], optional = true }
 xcap = { version = "0.0.14", optional = true }
@@ -36,10 +35,11 @@ enigo = { version = "0.3", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Foundation", "Win32_System_Console"] }
 tray-icon = "0.19"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_Registry"] }
 
 [features]
 default = ["screen", "input"]
-screen = ["dep:xcap", "dep:image", "dep:fast_image_resize", "dep:jpeg-encoder"]
+screen = ["dep:xcap", "dep:fast_image_resize", "dep:jpeg-encoder"]
 input = ["dep:enigo"]
 
 [profile.release]

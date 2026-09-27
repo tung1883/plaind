@@ -17,7 +17,7 @@
 | D→C | `{t:"welcome", proto:2, host, os:"linux\|macos\|windows", caps}` |
 | D→C | `{t:"error", code:"auth", msg}` then close — bad token |
 
-- `caps` ⊆ `["pty","session","proc","metrics","clip","sync","screen","input"]` (`screen`/`input` are build-time).
+- `caps` ⊆ `["pty","session","proc","metrics","clip","sync","echo_ack","screen","input"]` (`screen`/`input` are build-time).
 - Client pings `{t:"ping"}` every 15 s → `{t:"pong"}`. 20 s silence = dead.
 
 ## Channels
@@ -42,8 +42,19 @@ last 256 KB of output and replays it on reattach.
 | C→D | `{t:"session.kill", ch, id}` — terminate the shell |
 | C→D | `{t:"session.rename", ch, id, name}` — rename a persistent shell; daemon replies `session.list` |
 | C↔D | `{t:"pty.data", ch, data:<bin>}` — output / keystrokes for the bound session |
+| C→D | `{t:"pty.data", ch, data:<bin>, seq}` — keystrokes numbered for echo acks (`echo_ack` cap) |
+| D→C | `{t:"pty.data", ch, data:<bin>, ack?}` — output that also acks input up to `ack` |
+| D→C | `{t:"pty.ack", ch, seq}` — echo ack with no output to carry it |
 | C→D | `{t:"pty.resize", ch, cols, rows}` |
 | D→C | `{t:"pty.exit", ch, code}` |
+
+Echo ack (`echo_ack` cap, for the client's predictive local echo, mosh-style):
+the client numbers each keystroke batch with an increasing `seq`. The daemon
+reports `ack = N` once input `N` was fed to the shell at least 50 ms earlier —
+on the next output frame, or in a bare `pty.ack` if the shell printed nothing.
+The screen after an ack therefore reflects the shell's answer to every input up
+to `N`, so the client judges its guesses only then. Numbering restarts per
+attach.
 
 `{t:"pty.open", ch, cols, rows, cmd:null|"<str>"}` still works: it creates an
 **ephemeral** session that is killed when its channel closes (used by the test
@@ -57,15 +68,28 @@ which survives restarts too.
 
 | dir | message |
 |---|---|
-| C→D | `{t:"screen.start", ch, max_w, fps, cursor?:bool}` |
+| C→D | `{t:"screen.start", ch, max_w, fps, cursor?:bool, ack?:bool, tiles?:bool}` |
 | C→D | `{t:"screen.stop", ch}` |
+| C→D | `{t:"screen.ack", ch}` — one per received frame, when started with `ack:true` |
 | D→C | `{t:"screen.frame", ch, w, h, sw, sh, format:"jpeg", full:true, data:<bin>}` |
+| D→C | `{t:"screen.frame", ch, w, h, sw, sh, format:"jpeg", full:false, tiles:[{x, y, w, h, data:<bin>}]}` — only with `tiles:true` |
 
 - Whole-frame JPEG at `fps` (1–60; capture + encode may cap the real rate lower).
   `w`,`h` = delivered size; `sw`,`sh` =
   source monitor size (for client-side cursor scaling).
 - `cursor` (default true) = daemon draws the pointer on each frame; phone
   sends `false` and draws its own.
+- Frames are sent only when the desktop changed (an idle screen sends nothing).
+- `tiles:true` = partial updates: after a full frame, the daemon diffs 64 px
+  tiles against the last frame it sent and sends only the changed rectangles,
+  each its own JPEG at `x`,`y` in delivered-frame pixels, to paint over the
+  current image in order. A full frame still comes first, after a size change,
+  and whenever most of the screen changed.
+- `ack:true` = flow control, one `screen.ack` per `screen.frame` (full or
+  partial): the daemon bounds the un-acked bytes in flight by a budget that
+  grows while round trips stay near their floor and shrinks when they inflate
+  (resuming anyway after 2 s without an ack). Without it the daemon streams at
+  `fps` regardless.
 - Re-send `screen.start` on the same `ch` to change `max_w`/`fps` live
   (e.g. raise `max_w` when zoomed); the daemon swaps the stream.
 

@@ -3,7 +3,9 @@
 
 #[macro_use]
 pub mod plog;
+pub mod latstat;
 pub mod autostart;
+pub mod capture;
 pub mod clip;
 pub mod filesync;
 pub mod input;

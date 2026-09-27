@@ -38,7 +38,23 @@ fn partial_path(path: &Path) -> PathBuf {
 
 // --- fs.list: one directory's immediate children, for the remote folder picker
 
+/// A path this can never collide with on any real filesystem — sent by the
+/// client (never typed by anyone) to mean "list drives, not a directory".
+/// The client walks up to this from a Windows drive root instead of dead-ending
+/// there, so a phone can still reach a second drive without ever typing a path.
+pub const DRIVES_SENTINEL: &str = "\u{0}drives";
+
+/// An empty `path` means "start the picker somewhere sensible" — the user's
+/// home directory, so a fresh wizard doesn't open on the filesystem root.
 pub fn fs_list(ch: i64, path: String) -> Value {
+    if path == DRIVES_SENTINEL {
+        return proto::fs_list(ch, DRIVES_SENTINEL, list_drives());
+    }
+    let path = if path.is_empty() {
+        dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or(path)
+    } else {
+        path
+    };
     let entries = fs::read_dir(&path)
         .map(|rd| {
             let mut out: Vec<(String, bool)> = rd
@@ -53,7 +69,22 @@ pub fn fs_list(ch: i64, path: String) -> Value {
             out
         })
         .unwrap_or_default();
-    proto::fs_list(ch, entries)
+    proto::fs_list(ch, &path, entries)
+}
+
+#[cfg(windows)]
+fn list_drives() -> Vec<(String, bool)> {
+    (b'A'..=b'Z')
+        .filter_map(|b| {
+            let root = format!("{}:\\", b as char);
+            Path::new(&root).exists().then(|| (root, true))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn list_drives() -> Vec<(String, bool)> {
+    vec![("/".to_string(), true)]
 }
 
 // --- sync.list: recursive listing of one root, optionally content-hashed

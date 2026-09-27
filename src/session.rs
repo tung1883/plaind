@@ -41,9 +41,23 @@ async fn run(stream: TcpStream, peer: SocketAddr) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Value>(16);
     let writer = tokio::spawn(async move {
         while let Some(value) = rx.recv().await {
+            // frames still waiting behind this one
+            crate::latstat::record("d.queue_depth", rx.len() as f64);
+            let name = match &value {
+                Value::Map(m) => match proto::msg_type(m) {
+                    "pty.data" => "d.write.pty",
+                    "screen.frame" => "d.write.screen",
+                    "pong" => "d.write.pong",
+                    _ => "d.write.other",
+                },
+                _ => "d.write.other",
+            };
+            let t0 = std::time::Instant::now();
             if proto::write_frame(&mut wr, &value).await.is_err() {
                 break;
             }
+            // time for the socket to accept the frame — grows when the link is saturated
+            crate::latstat::record(name, crate::latstat::ms(t0.elapsed()));
         }
     });
 
@@ -82,7 +96,7 @@ where
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
     crate::plog!("[{peer}] paired device connected: {device}");
 
-    let mut caps = vec!["pty", "session", "proc", "metrics", "clip", "sync"];
+    let mut caps = vec!["pty", "session", "proc", "metrics", "clip", "sync", "echo_ack"];
     if ScreenStream::SUPPORTED {
         caps.push("screen");
     }
@@ -199,7 +213,11 @@ where
                     (attached.get(&ch).copied(), proto::get_bin(&frame, "data"))
                 {
                     if let Some(s) = sessions().get(id) {
+                        s.mark_input();
                         s.feed(data);
+                        if let Some(seq) = proto::get_i64(&frame, "seq") {
+                            s.note_input(seq as u64);
+                        }
                     }
                 }
             }
@@ -231,12 +249,22 @@ where
                     let max_w = proto::get_i64(&frame, "max_w").unwrap_or(1280) as u32;
                     let fps = proto::get_i64(&frame, "fps").unwrap_or(5);
                     let cursor = proto::get(&frame, "cursor").and_then(|v| v.as_bool()).unwrap_or(true);
-                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, tx.clone()));
-                    crate::plog!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor}");
+                    let ack = proto::get_bool(&frame, "ack");
+                    let tiles = proto::get_bool(&frame, "tiles");
+                    // A restart on the same channel: stop the old capture first so
+                    // two desktop duplications never overlap.
+                    screens.remove(&ch);
+                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, ack, tiles, tx.clone()));
+                    crate::plog!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor} ack={ack} tiles={tiles}");
                 }
             }
             "screen.stop" => {
                 screens.remove(&ch);
+            }
+            "screen.ack" => {
+                if let Some(s) = screens.get(&ch) {
+                    s.ack();
+                }
             }
             "input.move" | "input.point" | "input.click" | "input.down" | "input.up"
             | "input.key" | "input.zoom" => {

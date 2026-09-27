@@ -128,6 +128,29 @@ pub fn pty_data(ch: i64, data: &[u8]) -> Value {
     ])
 }
 
+/// Output that also carries an echo ack: every input up to `ack` was fed to
+/// the shell at least `ECHO_WAIT` before this output was read.
+pub fn pty_data_ack(ch: i64, data: &[u8], ack: Option<u64>) -> Value {
+    let mut v = vec![
+        ("t", s("pty.data")),
+        ("ch", Value::from(ch)),
+        ("data", Value::Binary(data.to_vec())),
+    ];
+    if let Some(a) = ack {
+        v.push(("ack", Value::from(a)));
+    }
+    map(v)
+}
+
+/// An echo ack with no output to ride on (the shell printed nothing).
+pub fn pty_ack(ch: i64, seq: u64) -> Value {
+    map(vec![
+        ("t", s("pty.ack")),
+        ("ch", Value::from(ch)),
+        ("seq", Value::from(seq)),
+    ])
+}
+
 pub fn pty_exit(ch: i64, code: i64) -> Value {
     map(vec![
         ("t", s("pty.exit")),
@@ -193,6 +216,34 @@ pub fn screen_frame(ch: i64, w: u32, h: u32, sw: u32, sh: u32, jpeg: Vec<u8>) ->
     ])
 }
 
+/// A partial update: only the changed rectangles of the delivered frame,
+/// each its own JPEG, to be painted over the client's current image.
+pub fn screen_tiles(ch: i64, w: u32, h: u32, sw: u32, sh: u32, tiles: Vec<(u32, u32, u32, u32, Vec<u8>)>) -> Value {
+    let tiles = tiles
+        .into_iter()
+        .map(|(x, y, tw, th, jpeg)| {
+            map(vec![
+                ("x", Value::from(x)),
+                ("y", Value::from(y)),
+                ("w", Value::from(tw)),
+                ("h", Value::from(th)),
+                ("data", Value::Binary(jpeg)),
+            ])
+        })
+        .collect();
+    map(vec![
+        ("t", s("screen.frame")),
+        ("ch", Value::from(ch)),
+        ("w", Value::from(w)),
+        ("h", Value::from(h)),
+        ("sw", Value::from(sw)),
+        ("sh", Value::from(sh)),
+        ("format", s("jpeg")),
+        ("full", Value::Boolean(false)),
+        ("tiles", Value::Array(tiles)),
+    ])
+}
+
 pub fn proc_list(ch: i64, procs: Vec<Value>, sys: Value) -> Value {
     map(vec![
         ("t", s("proc.list")),
@@ -242,7 +293,7 @@ pub fn clip(ch: i64, text: &str) -> Value {
 
 // --- file sync ---------------------------------------------------------------
 
-pub fn fs_list(ch: i64, entries: Vec<(String, bool)>) -> Value {
+pub fn fs_list(ch: i64, path: &str, entries: Vec<(String, bool)>) -> Value {
     let arr = entries
         .into_iter()
         .map(|(name, is_dir)| map(vec![("name", s(&name)), ("is_dir", Value::Boolean(is_dir))]))
@@ -250,6 +301,7 @@ pub fn fs_list(ch: i64, entries: Vec<(String, bool)>) -> Value {
     map(vec![
         ("t", s("fs.list")),
         ("ch", Value::from(ch)),
+        ("path", s(path)),
         ("entries", Value::Array(arr)),
     ])
 }
