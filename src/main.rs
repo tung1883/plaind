@@ -85,6 +85,8 @@ async fn main() -> Result<()> {
         autostart::ensure();
     }
     tray::spawn(port);
+    // Puzzle jobs that were running when the daemon last stopped pick up where they left off.
+    plaind::chess::jobs::registry().restore(14);
 
     if pairing::known_tokens().is_empty() {
         plog!("no paired devices yet — use the tray's \"Pairing code…\", or run `plaind pair`");

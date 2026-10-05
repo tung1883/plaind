@@ -35,14 +35,31 @@ async fn run(stream: TcpStream, peer: SocketAddr) -> Result<()> {
     stream.set_nodelay(true).ok();
     let (mut rd, mut wr) = stream.into_split();
 
-    // Small on purpose: screen frames must not pile up here (they use try_send
-    // and drop when it's full), and pty output is tiny — a deep buffer just adds
-    // latency.
+    // Two queues into one writer. `tx` carries everything interactive (shell output, acks,
+    // pongs, replies); `tx_bulk` carries screen frames and file downloads. The writer always
+    // takes from `tx` first, so a typed key's echo only ever waits behind the one frame that is
+    // already being written, not behind a backlog of screen frames. Both are small on purpose:
+    // screen frames must not pile up (they use try_send and drop when full) and a deep buffer
+    // just adds latency.
     let (tx, mut rx) = mpsc::channel::<Value>(16);
+    let (tx_bulk, mut rx_bulk) = mpsc::channel::<Value>(16);
     let writer = tokio::spawn(async move {
-        while let Some(value) = rx.recv().await {
+        let (mut hi_open, mut lo_open) = (true, true);
+        loop {
+            let value = tokio::select! {
+                biased;
+                v = rx.recv(), if hi_open => match v {
+                    Some(v) => v,
+                    None => { hi_open = false; continue; }
+                },
+                v = rx_bulk.recv(), if lo_open => match v {
+                    Some(v) => v,
+                    None => { lo_open = false; continue; }
+                },
+                else => break,
+            };
             // frames still waiting behind this one
-            crate::latstat::record("d.queue_depth", rx.len() as f64);
+            crate::latstat::record("d.queue_depth", (rx.len() + rx_bulk.len()) as f64);
             let name = match &value {
                 Value::Map(m) => match proto::msg_type(m) {
                     "pty.data" => "d.write.pty",
@@ -61,13 +78,19 @@ async fn run(stream: TcpStream, peer: SocketAddr) -> Result<()> {
         }
     });
 
-    let result = frame_loop(&mut rd, &tx, peer).await;
+    let result = frame_loop(&mut rd, &tx, &tx_bulk, peer).await;
     drop(tx);
+    drop(tx_bulk);
     let _ = writer.await;
     result
 }
 
-async fn frame_loop<R>(rd: &mut R, tx: &mpsc::Sender<Value>, peer: SocketAddr) -> Result<()>
+async fn frame_loop<R>(
+    rd: &mut R,
+    tx: &mpsc::Sender<Value>,
+    tx_bulk: &mpsc::Sender<Value>,
+    peer: SocketAddr,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -96,7 +119,7 @@ where
     let device = proto::get_str(&hello, "device").unwrap_or("phone");
     crate::plog!("[{peer}] paired device connected: {device}");
 
-    let mut caps = vec!["pty", "session", "proc", "metrics", "clip", "sync", "echo_ack"];
+    let mut caps = vec!["pty", "session", "proc", "metrics", "clip", "sync", "sync_hash", "echo_ack", "keyhold", "chess"];
     if ScreenStream::SUPPORTED {
         caps.push("screen");
     }
@@ -114,6 +137,7 @@ where
     let mut clip_watches: HashMap<i64, clip::Watch> = HashMap::new();
     let clip_last = clip::new_last_seen();
     let mut puts: HashMap<i64, PutState> = HashMap::new();
+    let mut chess = crate::chess::wire::Conn::new();
 
     while let Some(frame) = proto::read_frame(rd).await? {
         let ch = proto::get_i64(&frame, "ch").unwrap_or(-1);
@@ -254,7 +278,7 @@ where
                     // A restart on the same channel: stop the old capture first so
                     // two desktop duplications never overlap.
                     screens.remove(&ch);
-                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, ack, tiles, tx.clone()));
+                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, ack, tiles, tx_bulk.clone()));
                     crate::plog!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor} ack={ack} tiles={tiles}");
                 }
             }
@@ -267,7 +291,7 @@ where
                 }
             }
             "input.move" | "input.point" | "input.click" | "input.down" | "input.up"
-            | "input.key" | "input.zoom" => {
+            | "input.key" | "input.keydown" | "input.keyup" | "input.zoom" => {
                 input.handle(&frame);
             }
             "proc.list" => {
@@ -311,23 +335,45 @@ where
                     clip::set_text(text, &clip_last);
                 }
             }
+            // Listing, hashing and deleting can take long (big trees, slow or
+            // network drives): each runs on its own task and replies when done,
+            // so this loop keeps answering pings and other channels meanwhile.
             "fs.list" => {
                 let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
-                if let Ok(v) = tokio::task::spawn_blocking(move || filesync::fs_list(ch, path)).await {
-                    tx.send(v).await.ok();
-                }
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(v) = tokio::task::spawn_blocking(move || filesync::fs_list(ch, path)).await {
+                        tx.send(v).await.ok();
+                    }
+                });
             }
             "sync.list" => {
                 let root = proto::get_str(&frame, "root").unwrap_or_default().to_string();
                 let hash = proto::get_bool(&frame, "hash");
                 let tx = tx.clone();
-                if let Ok(entries) = tokio::task::spawn_blocking(move || filesync::sync_list(root, hash)).await {
-                    tx.send(proto::sync_list(ch, entries)).await.ok();
-                }
+                tokio::spawn(async move {
+                    let t0 = std::time::Instant::now();
+                    let r = root.clone();
+                    if let Ok(entries) = tokio::task::spawn_blocking(move || filesync::sync_list(r, hash)).await {
+                        crate::plog!("sync.list {root}: {} files in {:?}", entries.len(), t0.elapsed());
+                        tx.send(proto::sync_list(ch, entries)).await.ok();
+                    }
+                });
+            }
+            "sync.hash" => {
+                let root = proto::get_str(&frame, "root").unwrap_or_default().to_string();
+                let paths: Vec<String> = proto::get(&frame, "paths")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|p| p.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let tx = tx.clone();
+                crate::plog!("sync.hash {root}: {} files", paths.len());
+                tokio::task::spawn_blocking(move || filesync::sync_hash(ch, root, paths, tx));
             }
             "sync.put.begin" => {
                 let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
-                let outcome = tokio::task::spawn_blocking(move || PutState::begin(&path)).await;
+                let mtime = proto::get_i64(&frame, "mtime_ms");
+                let outcome = tokio::task::spawn_blocking(move || PutState::begin(&path, mtime)).await;
                 match outcome {
                     Ok(Ok((state, resume_offset))) => {
                         puts.insert(ch, state);
@@ -347,7 +393,10 @@ where
                     // Bounded to CHUNK_SIZE (256 KiB) by the client — a plain
                     // in-loop write is cheap enough not to need spawn_blocking,
                     // same as the small synchronous fs calls already used above.
-                    if state.write_chunk(offset.max(0) as u64, data).is_err() {
+                    let tw = std::time::Instant::now();
+                    let wrote = state.write_chunk(offset.max(0) as u64, data);
+                    crate::latstat::record("d.sync.put_chunk_write_ms", crate::latstat::ms(tw.elapsed()));
+                    if wrote.is_err() {
                         puts.remove(&ch);
                         tx.send(chan_error(ch, "sync.put.chunk failed")).await.ok();
                     }
@@ -366,19 +415,28 @@ where
             }
             "sync.delete" => {
                 let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
-                let ok = tokio::task::spawn_blocking(move || filesync::delete(&path)).await.unwrap_or(false);
-                tx.send(proto::sync_delete_done(ch, ok)).await.ok();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let ok = tokio::task::spawn_blocking(move || filesync::delete(&path)).await.unwrap_or(false);
+                    tx.send(proto::sync_delete_done(ch, ok)).await.ok();
+                });
             }
             "sync.get.begin" => {
                 let path = proto::get_str(&frame, "path").unwrap_or_default().to_string();
                 let resume_offset = proto::get_i64(&frame, "resume_offset").unwrap_or(0).max(0) as u64;
-                tokio::spawn(filesync::send_file(ch, path, resume_offset, tx.clone()));
+                tokio::spawn(filesync::send_file(ch, path, resume_offset, tx_bulk.clone()));
+            }
+            t if t.starts_with("chess.") => {
+                chess.handle(t, &frame, ch, tx).await;
             }
             other => {
                 crate::plog!("[{peer}] ignoring {other}");
             }
         }
     }
+
+    // Client gone: drop chess subscriptions (jobs keep running in the registry).
+    chess.shutdown();
 
     // Client gone: detach every session it held. Persistent ones keep running
     // (buffering output for the next reconnect); ephemeral ones are killed.

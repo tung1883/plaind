@@ -337,6 +337,20 @@ pub fn sync_list(ch: i64, entries: Vec<SyncEntry>) -> Value {
     ])
 }
 
+/// One file's content hash from a `sync.hash` request; `sha256` is absent
+/// when the file couldn't be read.
+pub fn sync_hash(ch: i64, path: &str, sha256: Option<String>) -> Value {
+    let mut v = vec![("t", s("sync.hash")), ("ch", Value::from(ch)), ("path", s(path))];
+    if let Some(h) = sha256 {
+        v.push(("sha256", s(&h)));
+    }
+    map(v)
+}
+
+pub fn sync_hash_end(ch: i64) -> Value {
+    map(vec![("t", s("sync.hash.end")), ("ch", Value::from(ch))])
+}
+
 pub fn sync_put_ready(ch: i64, resume_offset: u64) -> Value {
     map(vec![
         ("t", s("sync.put.ready")),

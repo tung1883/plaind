@@ -17,7 +17,7 @@
 | D→C | `{t:"welcome", proto:2, host, os:"linux\|macos\|windows", caps}` |
 | D→C | `{t:"error", code:"auth", msg}` then close — bad token |
 
-- `caps` ⊆ `["pty","session","proc","metrics","clip","sync","echo_ack","screen","input"]` (`screen`/`input` are build-time).
+- `caps` ⊆ `["pty","session","proc","metrics","clip","sync","sync_hash","echo_ack","screen","input"]` (`screen`/`input` are build-time).
 - Client pings `{t:"ping"}` every 15 s → `{t:"pong"}`. 20 s silence = dead.
 
 ## Channels
@@ -176,7 +176,10 @@ survives a daemon restart, not just a dropped connection.
 | D→C | `{t:"fs.list", ch, entries:[{name, is_dir}]}` |
 | C→D | `{t:"sync.list", ch, root, hash?:bool}` — recursive listing of one root; `hash` only when the pair's detect mode is checksum (hashing every file is expensive, so the client only asks for it when it needs it) |
 | D→C | `{t:"sync.list", ch, entries:[{path, size, mtime_ms, sha256?}]}` — `path` is relative to `root`, forward-slashed |
-| C→D | `{t:"sync.put.begin", ch, path, size, mtime_ms}` — upload, phone → daemon |
+| C→D | `{t:"sync.hash", ch, root, paths:[…]}` — hash just these files (`sync_hash` cap); clients use it only for paths whose size matches but mtime doesn't |
+| D→C | `{t:"sync.hash", ch, path, sha256?}` × N — one per file as it finishes; no `sha256` = unreadable |
+| D→C | `{t:"sync.hash.end", ch}` |
+| C→D | `{t:"sync.put.begin", ch, path, size, mtime_ms}` — upload, phone → daemon; the finished file gets `mtime_ms` as its modified time |
 | D→C | `{t:"sync.put.ready", ch, resume_offset}` — bytes of `<path>.partial` already on disk; the client resumes from here, not necessarily 0 |
 | C→D | `{t:"sync.put.chunk", ch, offset, data:<bin>}` × N, ≤256 KiB each |
 | C→D | `{t:"sync.put.end", ch}` — daemon renames `.partial` into place |
@@ -187,6 +190,56 @@ survives a daemon restart, not just a dropped connection.
 | D→C | `{t:"sync.get.end", ch, ok}` |
 | C→D | `{t:"sync.delete", ch, path}` — mirror cleanup, only sent when a pair has delete-propagation on |
 | D→C | `{t:"sync.delete.done", ch, ok}` |
+
+`fs.list`, `sync.list`, `sync.hash` and `sync.delete` run off the connection's
+frame loop and reply when done, so a long listing or hash never stalls pings,
+shells or the screen on the same connection.
+
+### chess puzzles
+
+Puzzle generation runs on the computer (capability `chess`, additive — `PROTO` is unchanged).
+The generator is a port of the phone's `PuzzleGenerator`, backed by Stockfish installed under
+`<data>/engines/`. A **job lives in the daemon**, not on the connection: it keeps running when the
+phone locks, sleeps or disconnects (the daemon also resumes it after a restart), and on reconnect
+the phone is replayed every result it has not acknowledged. One job runs at a time.
+
+Delivery is a numbered log. Each finished game appends one result `{seq, game, puzzle?}` (`seq`
+starts at 1, dense, increasing); the phone stores it, records `game` as scanned, then acks.
+
+| Dir | Message |
+|---|---|
+| C→D | `{t:"chess.status", ch}` |
+| D→C | `{t:"chess.status", ch, installed, version?, path?, cores, asset, installing, active_job?}` |
+| C→D | `{t:"chess.install", ch}` — daemon downloads Stockfish into its data folder (needs internet on the PC) |
+| D→C | `{t:"chess.install.progress", ch, stage:"download"\|"extract"\|"verify"\|"done", pct}` … then `{t:"chess.install.done", ch, ok, path?, version?, err?}` |
+| C→D | `{t:"chess.job.start", ch, job, total, workers?, threads?, hash_mb?, params?}` — `job` is a client-chosen id (`[A-Za-z0-9_-]+`); repeating an id returns the existing job |
+| D→C | `{t:"chess.job.started", ch, <snapshot>}` or `{t:"chess.error", ch, job, code, msg}` — codes `no_engine`, `busy`, `bad_request`, `no_job` |
+| C→D | `{t:"chess.games", ch, job, games:[{id, src, white, black, event, date, sans:[…]}]}` — mainline SAN tokens; chunk it (a few hundred games per frame, frames are ≤1 MiB); games already known by `id` are ignored, so re-sending everything after a reconnect is safe |
+| D→C | `{t:"chess.games.ack", ch, job, have}` — how many distinct games the job now holds |
+| C→D | `{t:"chess.games.end", ch, job}` — no more games; the job finishes when the queue drains |
+| C→D | `{t:"chess.attach", ch, job, after}` — subscribe; the daemon streams results with `seq > after` and then live ones |
+| D→C | `{t:"chess.results", ch, job, items:[{seq, game, puzzle?}]}` — `puzzle` = `{id, src, white, black, event, date, fen, ply, solution:[uci…], winner_white, category:"Mate"\|"Advantage", cp}`; `cp` is `i32::MAX-1` for mate lines. Solution UCI carries the promotion letter (`e7e8q`) |
+| D→C | `{t:"chess.progress", ch, <snapshot>}` — on change and at least every 2 s; the last one for a job has a terminal `state` and comes after its last result |
+| C→D | `{t:"chess.ack", ch, job, upto}` — results ≤ `upto` are stored; the daemon never replays them |
+| C→D | `{t:"chess.detach", ch}` — drop the subscription (the job keeps running). Closing the socket does the same |
+| C→D | `{t:"chess.job.list", ch}` → `{t:"chess.job.list", ch, jobs:[<snapshot>]}` — reconnect entry point |
+| C→D | `{t:"chess.cancel", ch, job}` — stops the job (state `cancelled`); results so far stay replayable |
+| C→D | `{t:"chess.job.remove", ch, job}` → `{t:"chess.job.removed", ch, job, ok, err?}` — only for finished jobs; deletes its files |
+
+`<snapshot>` = `{job, state:"running"\|"done"\|"cancelled"\|"failed", error?, total, have,
+games_complete, scanned, found, errors, workers, last_seq, acked, elapsed_s, eta_s?, cfg_workers,
+cfg_threads, cfg_hash_mb}`. `scanned` counts finished games (including ones skipped after repeated
+engine errors — those bump `errors` and report no puzzle).
+
+`params` (all optional; missing = PC default): `walk_depth` (20), `pair_depth` (22),
+`defense_depth` (16), `walk_cap_ms` (2000), `deep_cap_ms` (10000), `swing` (0.4),
+`only_move_margin` (0.5), `mate_margin` (0.4), `min_ply` (0), `strict` (bool — start from the
+upstream lichess thresholds 0.6 / 0.7 / 0.7). Depths are clamped to 60. `workers` defaults to
+half the cores (each worker runs its own single-threaded Stockfish), `hash_mb` to 128 per worker.
+
+**Reconnect recipe:** `chess.job.list` → for the job you were running, `chess.attach {after:
+<last seq you stored>}`; if `have < total` also re-send the games and `chess.games.end`; store
+results, ack, and when `state` is terminal and everything is acked send `chess.job.remove`.
 
 ## Errors
 

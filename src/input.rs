@@ -17,7 +17,55 @@ enum Cmd {
     Click(String, bool),
     Press(bool),
     Key(Option<String>, Option<String>, Vec<String>),
+    /// A key held down from the phone: pressed again on every repeat message, released by KeyUp
+    /// (or by the watchdog if the phone goes quiet). Modifiers are held around it.
+    KeyDown(String, Vec<String>),
+    KeyUp,
     Zoom(f64),
+}
+
+/// What is currently held down by KeyDown, so it can always be let go.
+#[cfg(feature = "input")]
+#[derive(Default)]
+struct Held {
+    key: Option<(enigo::Key, std::time::Instant)>,
+    mods: Vec<enigo::Key>,
+}
+
+#[cfg(feature = "input")]
+impl Held {
+    fn release_all(&mut self, enigo: &mut enigo::Enigo) {
+        use enigo::{Direction, Keyboard};
+        if let Some((k, _)) = self.key.take() {
+            let _ = enigo.key(k, Direction::Release);
+        }
+        for m in self.mods.drain(..).rev() {
+            let _ = enigo.key(m, Direction::Release);
+        }
+    }
+
+    /// The phone sends a repeat every few tens of ms while a key is held; if they stop, let go.
+    fn release_if_stale(&mut self, enigo: &mut enigo::Enigo) {
+        if let Some((_, at)) = self.key {
+            if at.elapsed() > std::time::Duration::from_secs(3) {
+                self.release_all(enigo);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "input")]
+fn modifier_keys(mods: &[String]) -> Vec<enigo::Key> {
+    use enigo::Key;
+    mods.iter()
+        .filter_map(|m| match m.as_str() {
+            "ctrl" => Some(Key::Control),
+            "alt" => Some(Key::Alt),
+            "shift" => Some(Key::Shift),
+            "meta" | "win" => Some(Key::Meta),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Input {
@@ -33,7 +81,16 @@ impl Input {
                 Ok(e) => e,
                 Err(_) => return,
             };
-            while let Ok(cmd) = rx.recv() {
+            let mut held = Held::default();
+            loop {
+                let cmd = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(c) => c,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        held.release_if_stale(&mut enigo);
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 match cmd {
                     Cmd::Move(dx, dy, scroll) => {
                         if dx != 0.0 || dy != 0.0 {
@@ -90,6 +147,25 @@ impl Input {
                             );
                         }
                     }
+                    Cmd::KeyDown(name, mods) => {
+                        let Some(key) = named_key(&name.to_lowercase(), &name) else { continue };
+                        // a different key than the one held: let that one go first
+                        if let Some((k, _)) = held.key {
+                            if k != key {
+                                let _ = enigo.key(k, Direction::Release);
+                                held.key = None;
+                            }
+                        }
+                        for m in modifier_keys(&mods) {
+                            if !held.mods.contains(&m) {
+                                let _ = enigo.key(m, Direction::Press);
+                                held.mods.push(m);
+                            }
+                        }
+                        let _ = enigo.key(key, Direction::Press);   // pressing again is a repeat
+                        held.key = Some((key, std::time::Instant::now()));
+                    }
+                    Cmd::KeyUp => held.release_all(&mut enigo),
                     Cmd::Key(text, key, mods) => {
                         use enigo::{Direction, Key};
                         let held: Vec<Key> = mods
@@ -116,6 +192,7 @@ impl Input {
                     }
                 }
             }
+            held.release_all(&mut enigo);   // the connection is gone: nothing stays pressed
         });
         Input { tx }
     }
@@ -145,6 +222,16 @@ impl Input {
                 )),
                 "input.down" => Some(Cmd::Press(true)),
                 "input.up" => Some(Cmd::Press(false)),
+                "input.keydown" => get_str(frame, "key").map(|k| {
+                    Cmd::KeyDown(
+                        k.to_string(),
+                        get(frame, "mods")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default(),
+                    )
+                }),
+                "input.keyup" => Some(Cmd::KeyUp),
                 "input.key" => Some(Cmd::Key(
                     get_str(frame, "text").map(String::from),
                     get_str(frame, "key").map(String::from),
@@ -160,7 +247,9 @@ impl Input {
                 _ => None,
             };
             if let Some(cmd) = cmd {
-                crate::plog!("[input] {}", msg_type(frame));
+                if msg_type(frame) != "input.keydown" {
+                    crate::plog!("[input] {}", msg_type(frame));
+                }
                 let _ = self.tx.send(cmd);
             }
         }
@@ -238,7 +327,15 @@ fn press_named(enigo: &mut enigo::Enigo, name: &str) {
         let _ = enigo.key(Key::Control, Direction::Release);
         return;
     }
-    let key = match lower.as_str() {
+    let Some(key) = named_key(&lower, name) else { return };
+    let _ = enigo.key(key, Direction::Click);
+}
+
+/// The key for a name from the phone ("enter", "f5", "capslock", "c" ...), or None.
+#[cfg(feature = "input")]
+fn named_key(lower: &str, original: &str) -> Option<enigo::Key> {
+    use enigo::Key;
+    let key = match lower {
         "enter" | "return" => Key::Return,
         "backspace" => Key::Backspace,
         "delete" | "del" => Key::Delete,
@@ -253,7 +350,33 @@ fn press_named(enigo: &mut enigo::Enigo, name: &str) {
         "left" => Key::LeftArrow,
         "right" => Key::RightArrow,
         "space" => Key::Space,
-        _ => return,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
+        "capslock" | "caps" => Key::CapsLock,
+        "win" | "meta" => Key::Meta,
+        #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+        "insert" | "ins" => Key::Insert,
+        #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+        "printscreen" | "prtsc" => Key::PrintScr,
+        #[cfg(windows)]
+        "menu" | "apps" => Key::Apps,
+        _ => {
+            let mut chars = original.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Key::Unicode(c),   // one character: that key
+                _ => return None,
+            }
+        }
     };
-    let _ = enigo.key(key, Direction::Click);
+    Some(key)
 }

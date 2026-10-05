@@ -5,9 +5,10 @@
 //! a run survives a daemon restart (unlike `pty::sessions()`, nothing here
 //! needs a process-global registry).
 //!
-//! Blocking filesystem work runs on `spawn_blocking`; `sync.get.*` streams a
-//! whole file from a spawned task so a slow download never stalls the
-//! connection's single frame-read loop.
+//! Blocking filesystem work runs on `spawn_blocking`, and anything that can
+//! take long (listing, hashing, deleting, `sync.get.*` streaming) runs on its
+//! own spawned task so it never stalls the connection's single frame-read
+//! loop — a stalled loop stops answering pings and the phone drops the link.
 
 use crate::proto::{self, SyncEntry};
 use anyhow::{anyhow, Result};
@@ -87,6 +88,23 @@ fn list_drives() -> Vec<(String, bool)> {
     vec![("/".to_string(), true)]
 }
 
+// --- sync.hash: content hashes of just the files the client asks about -----
+
+/// Hashes `root/<path>` for each of `paths`, sending one `sync.hash` frame per
+/// file as soon as it's done (so a big batch reports progress instead of
+/// going silent until the end), then `sync.hash.end`. Blocking: run it on
+/// `spawn_blocking`.
+pub fn sync_hash(ch: i64, root: String, paths: Vec<String>, tx: mpsc::Sender<Value>) {
+    let root_path = PathBuf::from(&root);
+    for rel in paths {
+        let sha = hash_file(&root_path.join(&rel)).ok();
+        if tx.blocking_send(proto::sync_hash(ch, &rel, sha)).is_err() {
+            return; // connection gone
+        }
+    }
+    let _ = tx.blocking_send(proto::sync_hash_end(ch));
+}
+
 // --- sync.list: recursive listing of one root, optionally content-hashed
 
 pub fn sync_list(root: String, hash: bool) -> Vec<SyncEntry> {
@@ -131,13 +149,16 @@ pub struct PutState {
     tmp: PathBuf,
     dest: PathBuf,
     file: File,
+    /// The phone's modified time for the file, applied on `finish` so both
+    /// sides agree and the next run's quick check sees it as unchanged.
+    mtime_ms: Option<i64>,
 }
 
 impl PutState {
     /// Opens (or resumes) the `.partial` sibling of `dest_path` and reports how
     /// many bytes of it already exist on disk — that's the resume point, read
     /// straight off the filesystem rather than any state kept in memory.
-    pub fn begin(dest_path: &str) -> Result<(Self, u64)> {
+    pub fn begin(dest_path: &str, mtime_ms: Option<i64>) -> Result<(Self, u64)> {
         let dest = PathBuf::from(dest_path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -148,7 +169,7 @@ impl PutState {
             .create(true)
             .write(true)
             .open(&tmp)?;
-        Ok((Self { tmp, dest, file }, resume_offset))
+        Ok((Self { tmp, dest, file, mtime_ms }, resume_offset))
     }
 
     /// Writes one chunk at `offset` (the client always sends the offset it
@@ -163,6 +184,12 @@ impl PutState {
 
     /// Flushes, then atomically installs the finished upload at its real path.
     pub fn finish(self) -> Result<()> {
+        if let Some(ms) = self.mtime_ms.filter(|ms| *ms > 0) {
+            let t = UNIX_EPOCH + std::time::Duration::from_millis(ms as u64);
+            if let Err(e) = self.file.set_modified(t) {
+                crate::plog!("sync.put: couldn't set mtime on {}: {e}", self.dest.display());
+            }
+        }
         drop(self.file);
         fs::rename(&self.tmp, &self.dest)?;
         Ok(())
@@ -210,15 +237,28 @@ async fn send_file_inner(ch: i64, path: &str, resume_offset: u64, tx: &mpsc::Sen
 
     let mut offset = start;
     let mut buf = vec![0u8; CHUNK_SIZE];
+    let t0 = std::time::Instant::now();
+    let (mut read_t, mut send_t) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     loop {
+        let tr = std::time::Instant::now();
         let n = file.read(&mut buf).await?;
+        read_t += tr.elapsed();
         if n == 0 {
             break;
         }
+        let ts = std::time::Instant::now();
         if tx.send(proto::sync_get_chunk(ch, offset, &buf[..n])).await.is_err() {
             return Err(anyhow!("connection closed"));
         }
+        send_t += ts.elapsed(); // waiting for room in the send queue = the link is the limit
         offset += n as u64;
+    }
+    let bytes = offset - start;
+    if bytes >= 256 * 1024 {
+        let secs = t0.elapsed().as_secs_f64().max(0.001);
+        crate::latstat::record("d.sync.get_mbps", bytes as f64 / 1e6 / secs);
+        crate::latstat::record("d.sync.get_disk_read_ms", crate::latstat::ms(read_t));
+        crate::latstat::record("d.sync.get_link_wait_ms", crate::latstat::ms(send_t));
     }
     Ok(())
 }

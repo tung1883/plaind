@@ -16,7 +16,11 @@ use tokio::sync::mpsc::Sender;
 /// A lost ack must not freeze the stream: after this long, send anyway.
 const ACK_STALL: Duration = Duration::from_secs(2);
 /// Byte budget bounds for un-acked frames in flight.
-const BUDGET_MIN: usize = 64 * 1024;
+/// The floor and the starting value are small: whatever is in flight is queued ahead of any
+/// shell byte written after it, and on a 256 kbit/s link 256 KB is eight seconds of that. The
+/// budget grows quickly (+32 KB per good ack) when the link can take more.
+const BUDGET_MIN: usize = 16 * 1024;
+const BUDGET_START: usize = 48 * 1024;
 const BUDGET_MAX: usize = 4 * 1024 * 1024;
 /// Tile edge for change detection, in delivered-frame pixels (a multiple of
 /// 16 so tile edges line up with JPEG's 4:2:0 blocks).
@@ -48,7 +52,7 @@ impl Flow {
             st: Mutex::new(FlowState {
                 inflight: VecDeque::new(),
                 bytes: 0,
-                budget: 256 * 1024,
+                budget: BUDGET_START,
                 min_rtt: Duration::MAX,
                 min_rtt_at: Instant::now(),
             }),

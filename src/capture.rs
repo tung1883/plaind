@@ -26,6 +26,12 @@ pub trait Capturer {
 
 /// Opened on the capture thread itself — the handles stay on that thread.
 pub fn open() -> Option<Box<dyn Capturer>> {
+    // Benchmarks: moving content generated in memory instead of the real desktop, so a test
+    // draws nothing on screen and needs nothing brought to the front. Set by `examples/netbench`.
+    if let Ok(mode) = std::env::var("PLAIND_SYNTH_SCREEN") {
+        crate::plog!("[screen] capture: synthetic ({mode})");
+        return Some(Box::new(Synthetic::new(mode == "high")));
+    }
     #[cfg(windows)]
     {
         match dxgi::Dxgi::new() {
@@ -39,6 +45,73 @@ pub fn open() -> Option<Box<dyn Capturer>> {
     let monitor = xcap::Monitor::all().ok()?.into_iter().next()?;
     crate::plog!("[screen] capture: xcap");
     Some(Box::new(Xcap { monitor }))
+}
+
+/// A fake 1920x1080 desktop that always changes. `noisy`: 400 random coloured blocks painted
+/// over the last frame every time (a big, busy change); otherwise a few bars slide across black
+/// (a calmer change). Pays a fixed `PLAIND_SYNTH_CAPTURE_MS` (default 4, about what DXGI
+/// duplication costs) per frame, on top of the time to paint it.
+struct Synthetic {
+    w: usize,
+    h: usize,
+    noisy: bool,
+    t: usize,
+    rng: u64,
+    cost: Duration,
+    buf: Vec<u8>,
+}
+
+impl Synthetic {
+    fn new(noisy: bool) -> Self {
+        let (w, h) = (1920, 1080);
+        let ms = std::env::var("PLAIND_SYNTH_CAPTURE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        Synthetic { w, h, noisy, t: 0, rng: 0x9E37_79B9_7F4A_7C15, cost: Duration::from_millis(ms), buf: vec![0; w * h * 4] }
+    }
+
+    fn rand(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    fn fill(&mut self, x: usize, y: usize, bw: usize, bh: usize, bgra: [u8; 4]) {
+        let x1 = (x + bw).min(self.w);
+        let y1 = (y + bh).min(self.h);
+        for row in y..y1 {
+            let start = (row * self.w + x) * 4;
+            for px in self.buf[start..(row * self.w + x1) * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(&bgra);
+            }
+        }
+    }
+}
+
+impl Capturer for Synthetic {
+    fn next(&mut self, _timeout: Duration) -> anyhow::Result<Option<Captured>> {
+        std::thread::sleep(self.cost);
+        if self.noisy {
+            for _ in 0..400 {
+                let c = self.rand();
+                let (x, y) = (self.rand() as usize % self.w, self.rand() as usize % self.h);
+                let (bw, bh) = (40 + self.rand() as usize % 80, 40 + self.rand() as usize % 80);
+                self.fill(x, y, bw, bh, [c as u8, (c >> 8) as u8, (c >> 16) as u8, 255]);
+            }
+        } else {
+            self.buf.fill(0);
+            for i in 0..6usize {
+                let x = (self.t * 7 + i * 230) % self.w;
+                let hue = ((self.t * 2 + i * 50) & 0xFF) as u8;
+                self.fill(x, 60 + i * 90, 260, 60, [0x40, hue, 0xC0, 255]);
+            }
+        }
+        self.t += 1;
+        Ok(Some(Captured { width: self.w as u32, height: self.h as u32, pixels: self.buf.clone(), bgra: true }))
+    }
+
+    fn origin(&self) -> (i32, i32) {
+        (0, 0)
+    }
 }
 
 struct Xcap {
