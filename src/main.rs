@@ -3,6 +3,8 @@
 //!   plaind            run the daemon (starts on login, tray icon, no window)
 //!   plaind pair       mint a pairing token and print its link + QR code
 //!   plaind uninstall  stop starting on login
+//!   plaind service install | uninstall | status
+//!                     Windows: full control (elevated windows, UAC prompts, lock screen)
 //
 // Release builds are windowless (no console); `AttachConsole` below reclaims the
 // parent terminal for the text subcommands.
@@ -36,8 +38,7 @@ fn attach_console() {
 #[cfg(not(windows))]
 fn attach_console() {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Screen capture, cursor read and pointer move must all share one pixel
     // space; without this they disagree under display scaling.
     make_dpi_aware();
@@ -68,13 +69,56 @@ async fn main() -> Result<()> {
         }
         Some("-h") | Some("--help") | Some("help") => {
             attach_console();
-            println!("usage: plaind [pair | install | uninstall]");
+            println!("usage: plaind [pair | install | uninstall | service install|uninstall|status]");
             return Ok(());
         }
+        #[cfg(windows)]
+        Some("service") => {
+            attach_console();
+            return plaind::service::cli(args.get(2).map(String::as_str));
+        }
+        // The next two are started by Windows and by the service, not by hand.
+        #[cfg(windows)]
+        Some("service-run") => {
+            log_to_machine_dir();
+            plog::init_as("service");
+            return plaind::service::run();
+        }
+        #[cfg(windows)]
+        Some("desktop-agent") => return run_agent(args.iter().any(|a| a == "--dev")),
         _ => {}
     }
 
-    // Daemon run.
+    run_daemon(port)
+}
+
+/// The service and its agent run as SYSTEM from Program Files: their logs go to the machine's
+/// own folder, never next to the exe.
+#[cfg(windows)]
+fn log_to_machine_dir() {
+    if std::env::var_os("PLAIND_DATA").is_none() {
+        std::env::set_var("PLAIND_DATA", paths::machine_dir());
+    }
+}
+
+/// The desktop agent (see `agent.rs`). Not for running by hand, except with `--dev`.
+#[cfg(windows)]
+#[tokio::main]
+async fn run_agent(dev: bool) -> Result<()> {
+    attach_console();
+    if !dev {
+        log_to_machine_dir();
+    }
+    plog::init_as("agent");
+    let outcome = plaind::agent::run(dev).await;
+    if let Err(e) = &outcome {
+        plog!("agent: stopped: {e:#}");
+    }
+    outcome
+}
+
+#[tokio::main]
+async fn run_daemon(port: u16) -> Result<()> {
     attach_console(); // harmless when launched from a terminal; no-op on login
     plog::init();
     plog!("plaind starting on :{port}  ({})", if paths::is_portable() { "portable" } else { "installed" });

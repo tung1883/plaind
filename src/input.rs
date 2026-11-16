@@ -77,11 +77,18 @@ impl Input {
         std::thread::spawn(move || {
             #[allow(unused_imports)]
             use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+            #[cfg(windows)]
+            crate::windesk::attach_input_desktop();
             let mut enigo = match Enigo::new(&Settings::default()) {
                 Ok(e) => e,
-                Err(_) => return,
+                Err(e) => {
+                    crate::plog!("[input] unavailable: {e}");
+                    return;
+                }
             };
             let mut held = Held::default();
+            #[cfg(windows)]
+            let mut looked = std::time::Instant::now();
             loop {
                 let cmd = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(c) => c,
@@ -91,6 +98,16 @@ impl Input {
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                // The input may have moved to another desktop (a UAC prompt, the lock screen) or
+                // back. Whatever is held is let go on the desktop it was pressed on.
+                #[cfg(windows)]
+                if crate::windesk::following() && looked.elapsed() >= std::time::Duration::from_millis(150) {
+                    looked = std::time::Instant::now();
+                    let moved = crate::windesk::attach_input_desktop_after(|| held.release_all(&mut enigo));
+                    if let crate::windesk::Attach::Changed(name) = moved {
+                        crate::plog!("[input] desktop -> {name}");
+                    }
+                }
                 match cmd {
                     Cmd::Move(dx, dy, scroll) => {
                         if dx != 0.0 || dy != 0.0 {
@@ -101,7 +118,7 @@ impl Input {
                         }
                     }
                     Cmd::Point(nx, ny) => {
-                        point_absolute(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
+                        inject(|| point_absolute(nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0)));
                     }
                     // Trackpad pinch: Ctrl + wheel, which most apps read as zoom.
                     Cmd::Zoom(ticks) => {
@@ -116,7 +133,7 @@ impl Input {
                         crate::plog!("[input] click {button} double={double}");
                         #[cfg(windows)]
                         {
-                            raw_button(&button, true);
+                            inject(|| raw_button(&button, true));
                             raw_button(&button, false);
                             if double {
                                 raw_button(&button, true);
@@ -138,7 +155,7 @@ impl Input {
                     }
                     Cmd::Press(down) => {
                         #[cfg(windows)]
-                        raw_button("l", down);
+                        inject(|| raw_button("l", down));
                         #[cfg(not(windows))]
                         {
                             let _ = enigo.button(
@@ -258,11 +275,24 @@ impl Input {
     }
 }
 
+/// Run one raw injection (`false` = Windows did not take it). It is refused when the input has
+/// just moved to another desktop: follow it there and try once more.
+#[cfg(feature = "input")]
+fn inject(mut send: impl FnMut() -> bool) {
+    if send() {
+        return;
+    }
+    #[cfg(windows)]
+    if matches!(crate::windesk::attach_input_desktop(), crate::windesk::Attach::Changed(_)) {
+        send();
+    }
+}
+
 /// Move the pointer to a fraction of the primary monitor. Uses an absolute
 /// `SendInput` move — unlike `SetCursorPos`, this counts as real mouse input,
 /// so Windows un-hides a cursor that was hidden after keyboard typing.
 #[cfg(all(feature = "input", windows))]
-fn point_absolute(nx: f64, ny: f64) {
+fn point_absolute(nx: f64, ny: f64) -> bool {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
@@ -276,14 +306,14 @@ fn point_absolute(nx: f64, ny: f64) {
         input.Anonymous.mi.dx = x;
         input.Anonymous.mi.dy = y;
         input.Anonymous.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-        SendInput(1, &input, size_of::<INPUT>() as i32);
+        SendInput(1, &input, size_of::<INPUT>() as i32) == 1
     }
 }
 
 /// Raw mouse button down/up via SendInput — never touches the cursor position,
 /// so a click after a tap-to-point leaves the pointer where the tap put it.
 #[cfg(windows)]
-fn raw_button(button: &str, down: bool) {
+fn raw_button(button: &str, down: bool) -> bool {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -301,18 +331,19 @@ fn raw_button(button: &str, down: bool) {
         let mut input: INPUT = zeroed();
         input.r#type = INPUT_MOUSE;
         input.Anonymous.mi.dwFlags = flag;
-        SendInput(1, &input, size_of::<INPUT>() as i32);
+        SendInput(1, &input, size_of::<INPUT>() as i32) == 1
     }
 }
 
 #[cfg(all(feature = "input", not(windows)))]
-fn point_absolute(nx: f64, ny: f64) {
+fn point_absolute(nx: f64, ny: f64) -> bool {
     // non-Windows: fall back through a fresh enigo (rare path)
     use enigo::{Coordinate, Enigo, Mouse, Settings};
     if let Ok(mut e) = Enigo::new(&Settings::default()) {
         let (w, h) = e.main_display().unwrap_or((1920, 1080));
         let _ = e.move_mouse((nx * w as f64) as i32, (ny * h as f64) as i32, Coordinate::Abs);
     }
+    true
 }
 
 #[cfg(feature = "input")]
@@ -320,6 +351,12 @@ fn press_named(enigo: &mut enigo::Enigo, name: &str) {
     use enigo::{Direction, Key, Keyboard};
     let lower = name.to_lowercase();
     if lower == "ctrl-alt-delete" {
+        // Windows takes the real thing only from a service; the desktop agent can ask ours.
+        // Anywhere else this is three ordinary key presses, which most programs still see.
+        #[cfg(windows)]
+        if crate::service::request_sas() {
+            return;
+        }
         let _ = enigo.key(Key::Control, Direction::Press);
         let _ = enigo.key(Key::Alt, Direction::Press);
         let _ = enigo.key(Key::Delete, Direction::Click);

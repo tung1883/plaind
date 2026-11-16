@@ -15,12 +15,17 @@ pub fn log_path() -> std::path::PathBuf {
 }
 
 pub fn init() {
+    init_as("plaind");
+}
+
+/// Log to `<name>.log`: the service and the desktop agent each keep their own file.
+pub fn init_as(name: &str) {
     let dir = log_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = log_path();
+    let path = dir.join(format!("{name}.log"));
     // rotate once past ~2 MB
     if std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false) {
-        let _ = std::fs::rename(&path, dir.join("plaind.log.1"));
+        let _ = std::fs::rename(&path, dir.join(format!("{name}.log.1")));
     }
     if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = FILE.set(Mutex::new(f));

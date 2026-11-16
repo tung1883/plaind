@@ -1,7 +1,8 @@
 //! Start `plaind` automatically when the user logs in.
 //!
 //! It runs in the interactive user session (not a Windows service / systemd
-//! system unit) — screen capture and input injection only work there.
+//! system unit): shells, file sync and the clipboard belong to the person logged in.
+//! On Windows, `service.rs` adds an optional service beside it for the screen and input only.
 
 use anyhow::{Context, Result};
 use std::process::Command;

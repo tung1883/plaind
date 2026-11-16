@@ -116,6 +116,16 @@ pub fn error(code: &str, message: &str) -> Value {
     ])
 }
 
+/// An error scoped to one channel; the connection stays up.
+pub fn chan_error(ch: i64, message: &str) -> Value {
+    map(vec![
+        ("t", s("error")),
+        ("ch", Value::from(ch)),
+        ("code", s("channel")),
+        ("msg", s(message)),
+    ])
+}
+
 pub fn pong() -> Value {
     map(vec![("t", s("pong"))])
 }

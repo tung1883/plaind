@@ -33,16 +33,22 @@ fn run(port: u16) {
         crate::autostart::is_installed(),
         None,
     );
+    // Full control (see `service.rs`): whether a desktop agent is doing the screen and input,
+    // and the way to install or remove the service behind it.
+    let desktop = MenuItem::new("desktop: …", false, None);
+    let full_control = MenuItem::new("Install full control…", true, None);
     let quit = MenuItem::new("Quit plaind", true, None);
     let sep = || PredefinedMenuItem::separator();
     let _ = menu.append_items(&[
         &header,
         &status,
+        &desktop,
         &sep(),
         &pair,
         &open_log,
         &sep(),
         &on_login,
+        &full_control,
         &sep(),
         &quit,
     ]);
@@ -64,8 +70,22 @@ fn run(port: u16) {
 
     let events = MenuEvent::receiver();
     let mut last_n = usize::MAX;
+    let mut service_installed = false;
+    let mut looked: Option<std::time::Instant> = None;
 
     loop {
+        // Cheap, but not free: every few seconds is plenty.
+        if looked.map_or(true, |t| t.elapsed() >= Duration::from_secs(3)) {
+            looked = Some(std::time::Instant::now());
+            service_installed = crate::service::is_installed();
+            desktop.set_text(if crate::service::agent_reachable() {
+                "desktop: full control"
+            } else {
+                "desktop: this session only"
+            });
+            full_control.set_text(if service_installed { "Remove full control…" } else { "Install full control…" });
+        }
+
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -85,6 +105,10 @@ fn run(port: u16) {
                 } else {
                     crate::autostart::uninstall()
                 };
+            } else if ev.id == *full_control.id() {
+                // Windows asks for consent; the status line above shows the outcome.
+                crate::service::run_elevated(if service_installed { "uninstall" } else { "install" });
+                looked = None;
             } else if ev.id == *quit.id() {
                 std::process::exit(0);
             }

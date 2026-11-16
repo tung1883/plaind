@@ -17,6 +17,20 @@ pub struct Captured {
     pub bgra: bool,
 }
 
+/// Returned by [`Capturer::next`] when the input moved to another desktop (a UAC prompt, the
+/// lock screen) and this thread cannot follow it there: Windows refuses a thread that owns a
+/// window. A new thread, attached before it creates anything, can carry on.
+#[derive(Debug)]
+pub struct NeedsNewThread;
+
+impl std::fmt::Display for NeedsNewThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the capture thread cannot follow the input desktop")
+    }
+}
+
+impl std::error::Error for NeedsNewThread {}
+
 pub trait Capturer {
     /// The next desktop image, or `None` if nothing changed within `timeout`.
     fn next(&mut self, timeout: Duration) -> anyhow::Result<Option<Captured>>;
@@ -120,6 +134,10 @@ struct Xcap {
 
 impl Capturer for Xcap {
     fn next(&mut self, _timeout: Duration) -> anyhow::Result<Option<Captured>> {
+        #[cfg(windows)]
+        if let crate::windesk::Attach::Stuck = crate::windesk::attach_input_desktop() {
+            return Err(NeedsNewThread.into());
+        }
         let shot = self.monitor.capture_image()?;
         let (width, height) = (shot.width(), shot.height());
         Ok(Some(Captured { width, height, pixels: shot.into_raw(), bgra: false }))
@@ -161,6 +179,8 @@ pub(crate) mod dxgi {
         /// The next frame must be delivered even if duplication reports no
         /// new image (fresh duplication = a client that has nothing yet).
         need_full: bool,
+        /// Since when duplication has been failing to come back.
+        lost_at: Option<std::time::Instant>,
     }
 
     impl Dxgi {
@@ -213,6 +233,7 @@ pub(crate) mod dxgi {
                 staging: None,
                 origin: (r.left, r.top),
                 need_full: true,
+                lost_at: None,
             };
             me.duplicate()?;
             Ok(me)
@@ -269,10 +290,31 @@ pub(crate) mod dxgi {
         fn next(&mut self, timeout: Duration) -> Result<Option<Captured>> {
             if self.dup.is_none() {
                 // lost earlier (mode change, UAC / lock screen): keep retrying
-                if self.duplicate().is_err() {
-                    std::thread::sleep(timeout);
-                    return Ok(None);
+                match crate::windesk::attach_input_desktop() {
+                    crate::windesk::Attach::Stuck => return Err(super::NeedsNewThread.into()),
+                    crate::windesk::Attach::Changed(name) => crate::plog!("[screen] desktop -> {name}"),
+                    crate::windesk::Attach::Unchanged => {}
                 }
+                if self.duplicate().is_err() {
+                    // Following the input onto another desktop, the old device may never
+                    // duplicate again: after a second of trying, start over with a new one.
+                    let since = *self.lost_at.get_or_insert_with(std::time::Instant::now);
+                    let mut rebuilt = false;
+                    if crate::windesk::following() && since.elapsed() > Duration::from_secs(1) {
+                        match Self::new() {
+                            Ok(fresh) => {
+                                *self = fresh;
+                                rebuilt = true;
+                            }
+                            Err(_) => self.lost_at = Some(std::time::Instant::now()),
+                        }
+                    }
+                    if !rebuilt {
+                        std::thread::sleep(timeout);
+                        return Ok(None);
+                    }
+                }
+                self.lost_at = None;
             }
             let dup = self.dup.clone().unwrap();
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();

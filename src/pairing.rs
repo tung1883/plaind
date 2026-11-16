@@ -40,7 +40,8 @@ fn add_token(token: &str) -> Result<()> {
         .create(true)
         .append(true)
         .open(paired_file())?;
-    writeln!(f, "{token}")?;
+    // One write per token, so two appends at once cannot interleave.
+    f.write_all(format!("{token}\n").as_bytes())?;
     Ok(())
 }
 

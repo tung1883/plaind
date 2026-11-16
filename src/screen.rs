@@ -140,9 +140,13 @@ impl ScreenStream {
         let flow = ack.then(|| Arc::new(Flow::new()));
         let gate = flow.clone();
         let period = Duration::from_millis((1000 / fps.clamp(1, 60)) as u64);
-        std::thread::spawn(move || {
+        on_threads(move || {
+            #[cfg(windows)]
+            if let crate::windesk::Attach::Changed(name) = crate::windesk::attach_input_desktop() {
+                crate::plog!("[screen] on desktop {name}");
+            }
             let Some(mut cap) = crate::capture::open() else {
-                return;
+                return false;
             };
             // The last frame the client has (delivered size, pre-JPEG pixels).
             let mut shown: Option<(u32, u32, Vec<u8>)> = None;
@@ -163,6 +167,10 @@ impl ScreenStream {
                 let shot = match cap.next(Duration::from_millis(100)) {
                     Ok(Some(s)) => s,
                     Ok(None) => continue, // desktop unchanged
+                    Err(e) if e.is::<crate::capture::NeedsNewThread>() => {
+                        std::thread::sleep(Duration::from_millis(500)); // never a tight loop of threads
+                        return true;
+                    }
                     Err(e) => {
                         crate::plog!("[screen] capture failed: {e}");
                         std::thread::sleep(Duration::from_millis(200));
@@ -252,6 +260,7 @@ impl ScreenStream {
                     }
                 }
             }
+            false
         });
         ScreenStream { stop, flow }
     }
@@ -274,6 +283,17 @@ impl ScreenStream {
     }
 
     pub const SUPPORTED: bool = cfg!(feature = "screen");
+}
+
+/// Run `stream` on a thread of its own, and again on a new thread for as long as it returns
+/// `true` — its way of saying that this thread can no longer do the job but a new one can.
+#[cfg(feature = "screen")]
+fn on_threads(stream: impl Fn() -> bool + Send + 'static) {
+    std::thread::spawn(move || {
+        if stream() {
+            on_threads(stream);
+        }
+    });
 }
 
 impl Drop for ScreenStream {

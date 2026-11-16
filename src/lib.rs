@@ -4,10 +4,12 @@
 #[macro_use]
 pub mod plog;
 pub mod latstat;
+pub mod agent;
 pub mod autostart;
 pub mod capture;
 pub mod chess;
 pub mod clip;
+pub mod desktop;
 pub mod filesync;
 pub mod input;
 pub mod metrics;
@@ -17,5 +19,7 @@ pub mod proto;
 pub mod procs;
 pub mod pty;
 pub mod screen;
+pub mod service;
 pub mod session;
 pub mod tray;
+pub mod windesk;

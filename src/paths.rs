@@ -27,6 +27,13 @@ pub fn is_portable() -> bool {
     *P.get_or_init(|| std::env::var_os("PLAIND_DATA").is_none() && portable_dir().is_some())
 }
 
+/// Where the Windows service and its desktop agent keep their logs: a machine-wide folder only
+/// administrators can write to, since both run as SYSTEM.
+#[cfg(windows)]
+pub fn machine_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into())).join("plaind")
+}
+
 fn resolve() -> PathBuf {
     if let Some(d) = std::env::var_os("PLAIND_DATA") {
         return PathBuf::from(d);

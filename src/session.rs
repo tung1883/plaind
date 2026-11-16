@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::clip;
+use crate::desktop::Desktop;
 use crate::filesync::{self, PutState};
 use crate::input::Input;
 use crate::metrics::Metrics;
@@ -130,10 +131,9 @@ where
 
     // Channel state.
     let mut attached: HashMap<i64, u64> = HashMap::new(); // channel id -> session id
-    let mut screens: HashMap<i64, ScreenStream> = HashMap::new();
+    let desk = Desktop::spawn(format!("[{peer}]"), tx.clone(), tx_bulk.clone());
     let mut procs = Procs::new();
     let mut metrics = Metrics::new();
-    let input = Input::new();
     let mut clip_watches: HashMap<i64, clip::Watch> = HashMap::new();
     let clip_last = clip::new_last_seen();
     let mut puts: HashMap<i64, PutState> = HashMap::new();
@@ -160,7 +160,7 @@ where
                         crate::plog!("[{peer}] pty.open ch={ch} -> session {} {cols}x{rows}", sess.id);
                     }
                     Err(e) => {
-                        tx.send(chan_error(ch, &format!("pty failed: {e}"))).await.ok();
+                        tx.send(proto::chan_error(ch, &format!("pty failed: {e}"))).await.ok();
                     }
                 }
             }
@@ -187,7 +187,7 @@ where
                         match sessions().create(name, cols, rows, None, false) {
                             Ok(s) => s,
                             Err(e) => {
-                                tx.send(chan_error(ch, &format!("shell failed: {e}"))).await.ok();
+                                tx.send(proto::chan_error(ch, &format!("shell failed: {e}"))).await.ok();
                                 continue;
                             }
                         }
@@ -266,33 +266,10 @@ where
                     }
                 }
             }
-            "screen.start" => {
-                if !ScreenStream::SUPPORTED {
-                    tx.send(chan_error(ch, "screen not supported on this host")).await.ok();
-                } else {
-                    let max_w = proto::get_i64(&frame, "max_w").unwrap_or(1280) as u32;
-                    let fps = proto::get_i64(&frame, "fps").unwrap_or(5);
-                    let cursor = proto::get(&frame, "cursor").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let ack = proto::get_bool(&frame, "ack");
-                    let tiles = proto::get_bool(&frame, "tiles");
-                    // A restart on the same channel: stop the old capture first so
-                    // two desktop duplications never overlap.
-                    screens.remove(&ch);
-                    screens.insert(ch, ScreenStream::start(ch, max_w, fps, cursor, ack, tiles, tx_bulk.clone()));
-                    crate::plog!("[{peer}] screen.start ch={ch} max_w={max_w} fps={fps} cursor={cursor} ack={ack} tiles={tiles}");
-                }
-            }
-            "screen.stop" => {
-                screens.remove(&ch);
-            }
-            "screen.ack" => {
-                if let Some(s) = screens.get(&ch) {
-                    s.ack();
-                }
-            }
-            "input.move" | "input.point" | "input.click" | "input.down" | "input.up"
+            "screen.start" | "screen.stop" | "screen.ack"
+            | "input.move" | "input.point" | "input.click" | "input.down" | "input.up"
             | "input.key" | "input.keydown" | "input.keyup" | "input.zoom" => {
-                input.handle(&frame);
+                desk.forward(frame).await;
             }
             "proc.list" => {
                 let (list, sys) = procs.snapshot();
@@ -380,7 +357,7 @@ where
                         tx.send(proto::sync_put_ready(ch, resume_offset)).await.ok();
                     }
                     _ => {
-                        tx.send(chan_error(ch, "sync.put.begin failed")).await.ok();
+                        tx.send(proto::chan_error(ch, "sync.put.begin failed")).await.ok();
                     }
                 }
             }
@@ -398,7 +375,7 @@ where
                     crate::latstat::record("d.sync.put_chunk_write_ms", crate::latstat::ms(tw.elapsed()));
                     if wrote.is_err() {
                         puts.remove(&ch);
-                        tx.send(chan_error(ch, "sync.put.chunk failed")).await.ok();
+                        tx.send(proto::chan_error(ch, "sync.put.chunk failed")).await.ok();
                     }
                 }
             }
@@ -450,15 +427,6 @@ where
         }
     }
     Ok(())
-}
-
-fn chan_error(ch: i64, message: &str) -> Value {
-    proto::map(vec![
-        ("t", proto::s("error")),
-        ("ch", Value::from(ch)),
-        ("code", proto::s("channel")),
-        ("msg", proto::s(message)),
-    ])
 }
 
 fn hostname() -> String {
